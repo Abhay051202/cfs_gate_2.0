@@ -128,6 +128,8 @@ def test_multicamera_event_snapshot_bundling(repository, snapshots, make_job):
     event = repository.event(event_id)
     assert event['gate_id'] == 'lane-in'
     assert len(event['snapshots']) == 4
+    assert event['primary_camera_id'] == 'gate-in-1'
+    assert event['primary_snapshot_id'] is not None
     snap_cameras = {s['camera_id'] for s in event['snapshots']}
     assert snap_cameras == {'gate-in-1', 'gate-in-2', 'gate-in-3', 'gate-in-4'}
 

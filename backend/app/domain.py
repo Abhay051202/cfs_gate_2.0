@@ -40,6 +40,7 @@ class Validation:
     valid_format: bool
     valid_check_digit: bool
     validation_status: str
+    size_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,4 +55,6 @@ class Observation:
     started_at: datetime
     confirmed: bool
     all_detections: list[Detection] | None = None
+    slot_position: str = 'FRONT'
+    event_id: str | None = None
 

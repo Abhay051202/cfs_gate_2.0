@@ -5,10 +5,11 @@ import ipaddress
 import os
 import select
 import socket
+import ssl
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit, urlunsplit, quote
-from urllib.request import Request, build_opener, ProxyHandler, HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, HTTPRedirectHandler
+from urllib.request import Request, build_opener, ProxyHandler, HTTPDigestAuthHandler, HTTPPasswordMgrWithDefaultRealm, HTTPRedirectHandler, HTTPSHandler
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 from uuid import uuid4
@@ -96,7 +97,8 @@ def stream_uri(device, username='', password=''):
     host, endpoint = device['host'], device['endpoint']
     passwords = HTTPPasswordMgrWithDefaultRealm()
     passwords.add_password(None, endpoint, username, password)
-    opener = build_opener(ProxyHandler({}), NoRedirect(), HTTPDigestAuthHandler(passwords))
+    ctx = ssl._create_unverified_context()
+    opener = build_opener(ProxyHandler({}), NoRedirect(), HTTPDigestAuthHandler(passwords), HTTPSHandler(context=ctx))
 
     def soap(url, namespace, operation, content=''):
         same_host_url(url, host)

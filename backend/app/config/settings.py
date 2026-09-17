@@ -30,12 +30,19 @@ class CameraConfig(BaseModel):
     line_position: float = Field(default=0.5, gt=0, lt=1)
     line_deadband: float = Field(default=0.03, ge=0, lt=0.5)
     positive_crossing: Literal['ENTRY', 'EXIT'] = 'ENTRY'
+    occupancy_roi: tuple[float, float, float, float] = (0, 0, 1, 1)
+    gate_exit_axis: Literal['x', 'y'] | None = None
+    gate_exit_position: float = Field(default=.95, gt=0, lt=1)
+    gate_exit_positive: bool = True
 
     @model_validator(mode='after')
     def validate_geometry(self):
         x1, y1, x2, y2 = self.ocr_roi
         if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
             raise ValueError('ocr_roi must be a normalized nonempty rectangle')
+        x1, y1, x2, y2 = self.occupancy_roi
+        if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
+            raise ValueError('occupancy_roi must be a normalized nonempty rectangle')
         return self
 
 
@@ -60,9 +67,9 @@ class Settings(BaseSettings):
     target_classes: list[str] = ['container', 'trailer', 'truck', 'vehicle', 'feet', 'cointainer', 'container_object']
     ocr_classes: list[str] = ['container', 'trailer', 'cointainer', 'container_object', 'feet']
 
-    ocr_engine: Literal['easyocr', 'olmocr', 'qwen2_vl', 'qwen2vl'] = 'easyocr'
+    ocr_engine: Literal['olmocr', 'easyocr', 'qwen2_vl', 'qwen2vl'] = 'olmocr'
     ocr_model_name: str = 'Qwen/Qwen2-VL-2B-Instruct'
-    ocr_gpu: bool = False
+    ocr_gpu: bool = True
     ocr_download_enabled: bool = False
     ocr_model_directory: Path = Path('models/easyocr')
     inference_fps: float = Field(default=3, gt=0, le=60)
@@ -74,6 +81,12 @@ class Settings(BaseSettings):
     ocr_interval_seconds: float = Field(default=1, gt=0)
     ocr_queue_size: int = Field(default=8, ge=1, le=100)
     ocr_spool_max_mb: int = Field(default=10240, ge=1)
+    gate_clear_seconds: float = Field(default=7, ge=1, le=60)
+    stationary_drift_threshold: float = Field(default=.02, gt=0, lt=.05)
+    stationary_match_iou: float = Field(default=.45, ge=.45, lt=1)
+    stationary_seconds: float = Field(default=1, gt=0)
+    gate_observation_gap_seconds: float = Field(default=2, gt=0)
+    dwell_container_classes: list[str] = ['container', 'trailer', 'cointainer', 'container_object', 'feet']
     dedup_seconds: float = Field(default=30, gt=0)
     track_ttl_seconds: float = Field(default=5, gt=0)
     snapshot_directory: Path = Path('snapshots')
@@ -136,4 +149,8 @@ class Settings(BaseSettings):
 
 def resolve_source(camera: CameraConfig | CameraSourceConfig) -> str:
     # Explicit lookup avoids requiring every possible camera key in Settings.
-    return os.environ.get(camera.source_env, dotenv_values('.env').get(camera.source_env) or '')
+    if camera.source_env in os.environ:
+        return os.environ[camera.source_env]
+    if 'PYTEST_CURRENT_TEST' in os.environ:
+        return ''
+    return dotenv_values('.env').get(camera.source_env) or ''

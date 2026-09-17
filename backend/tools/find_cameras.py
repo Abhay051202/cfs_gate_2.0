@@ -249,11 +249,11 @@ def verify_and_unlock_streams(camera_ips: List[str], custom_password: str = None
     passwords = []
     if custom_password:
         passwords.append(custom_password)
-    for p in ["123456", "admin", "admin123", "admin@123", "Admin123", "Admin@123", "admin12345", "12345"]:
+    for p in ["Admin@123", "Prosper@123"]:
         if p not in passwords:
             passwords.append(p)
 
-    users = ["admin", "root"]
+    users = ["admin"]
 
     paths = [
         "/cam/realmonitor?channel=1&subtype=1",

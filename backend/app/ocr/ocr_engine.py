@@ -9,6 +9,38 @@ class OCREngine(Protocol):
     def read(self, image: Any) -> OCRRead: ...
 
 
+def _extract_text_from_items(items):
+    if not items:
+        return '', 0.0
+    # Check vertical columns first
+    cols = {}
+    for it in items:
+        xc = (it[0][0][0] + it[0][1][0]) / 2
+        yc = (it[0][0][1] + it[0][2][1]) / 2
+        matched_c = next((c for c in cols if abs(c - xc) < 55), None)
+        if matched_c is None:
+            matched_c = xc
+            cols[matched_c] = []
+        cols[matched_c].append(it)
+
+    import re
+    SIX_PREFIX = re.compile(r'(?<![A-Z0-9])([A-Z][\s-]*[A-Z][\s-]*[A-Z][\s-]*[UJZ](?:[\s-]*[0-9]){6})(?![A-Z0-9])')
+    from app.ocr.validator import CANDIDATE, STRUCTURE, correct_feet_size_codes
+    for c in sorted(cols.keys()):
+        chars = sorted(cols[c], key=lambda it: it[0][0][1])
+        col_text = ''.join(str(it[1]) for it in chars)
+        if STRUCTURE.search(col_text) or CANDIDATE.search(col_text) or SIX_PREFIX.search(col_text):
+            combined = ' '.join(str(it[1]) for it in chars)
+            min_conf = float(min(it[2] for it in chars)) if chars else 0.0
+            return correct_feet_size_codes(combined)[:4096], min_conf
+
+    # Standard horizontal reading order
+    h_items = sorted(items, key=lambda it: (it[0][0][1] // 30, it[0][0][0]))
+    combined = ' '.join(str(it[1]) for it in h_items)
+    min_conf = float(min(it[2] for it in h_items)) if h_items else 0.0
+    return correct_feet_size_codes(combined)[:4096], min_conf
+
+
 class EasyOCREngine:
     def __init__(self, settings):
         import easyocr
@@ -17,7 +49,10 @@ class EasyOCREngine:
                                      download_enabled=settings.ocr_download_enabled, verbose=False)
 
     def read(self, image) -> OCRRead:
+        import re
         import cv2
+        from app.ocr.validator import CANDIDATE, STRUCTURE
+        SIX_PREFIX = re.compile(r'(?<![A-Z0-9])([A-Z][\s-]*[A-Z][\s-]*[A-Z][\s-]*[UJZ](?:[\s-]*[0-9]){6})(?![A-Z0-9])')
         if image is None or getattr(image, 'size', 0) == 0:
             return OCRRead('', 0.0)
 
@@ -25,16 +60,59 @@ class EasyOCREngine:
         is_vertical = h > 1.5 * w
 
         proc_img = image
-        if is_vertical and w < 100:
-            scale = min(3.0, 120.0 / max(1, w))
-            proc_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        if is_vertical:
+            if w < 100:
+                scale = min(3.0, 120.0 / max(1, w))
+                proc_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+            proc_img = cv2.copyMakeBorder(proc_img, 25, 25, 25, 25, cv2.BORDER_CONSTANT, value=[255, 255, 255])
 
         items = self.reader.readtext(
             proc_img, detail=1, paragraph=False,
             allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
             rotation_info=[90, 180, 270] if not is_vertical else None,
-            low_text=0.3, text_threshold=0.4, link_threshold=0.2
+            link_threshold=0.9 if is_vertical else 0.2
         )
+
+        txt, conf = _extract_text_from_items(items)
+        if STRUCTURE.search(txt) or CANDIDATE.search(txt) or SIX_PREFIX.search(txt):
+            return OCRRead(txt, conf)
+
+        # If not vertical and no valid code found yet, check vertical post strips
+        if not is_vertical and w > 200:
+            strips = [
+                image[:, int(w * 0.60):],
+                image[int(h * 0.08):int(h * 0.90), int(w * 0.35):int(w * 0.80)]
+            ]
+            for strip in strips:
+                if strip.shape[0] < 50 or strip.shape[1] < 50:
+                    continue
+                items_strip = self.reader.readtext(
+                    strip, detail=1, paragraph=False,
+                    allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                    link_threshold=0.9
+                )
+                txt_strip, conf_strip = _extract_text_from_items(items_strip)
+                if STRUCTURE.search(txt_strip) or CANDIDATE.search(txt_strip) or SIX_PREFIX.search(txt_strip):
+                    return OCRRead(txt_strip, conf_strip)
+
+        # For vertical crops: if padded read didn't find a candidate, retry without padding.
+        # EasyOCR is inconsistent at boundaries — one pass may succeed where the other fails.
+        if is_vertical:
+            base_img = image
+            if w < 100:
+                scale = min(3.0, 120.0 / max(1, w))
+                base_img = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+            items2 = self.reader.readtext(
+                base_img, detail=1, paragraph=False,
+                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+                link_threshold=0.9
+            )
+            txt2, conf2 = _extract_text_from_items(items2)
+            if STRUCTURE.search(txt2) or CANDIDATE.search(txt2) or SIX_PREFIX.search(txt2):
+                return OCRRead(txt2, conf2)
+            # Keep the longer result (more characters extracted)
+            if len(txt2) > len(txt):
+                txt, conf = txt2, conf2
 
         if not items and is_vertical:
             rot_cw = cv2.rotate(proc_img, cv2.ROTATE_90_CLOCKWISE)
@@ -42,20 +120,9 @@ class EasyOCREngine:
                 rot_cw, detail=1, paragraph=False,
                 allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
             )
+            txt, conf = _extract_text_from_items(items)
 
-        if not items:
-            return OCRRead('', 0.0)
-
-        if is_vertical:
-            items = sorted(items, key=lambda it: it[0][0][1])
-        else:
-            items = sorted(items, key=lambda it: (it[0][0][1] // 30, it[0][0][0]))
-
-        combined_text = ' '.join(str(item[1]) for item in items)[:4096]
-        from app.ocr.validator import correct_feet_size_codes
-        combined_text = correct_feet_size_codes(combined_text)
-        min_conf = float(min(item[2] for item in items))
-        return OCRRead(combined_text, min_conf)
+        return OCRRead(txt, conf)
 
 
 class OlmOCREngine:
@@ -80,8 +147,8 @@ class OlmOCREngine:
             device_map=self.device
         )
         self.prompt = (
-            "You are a container OCR system. Read the container owner code and serial number printed vertically or horizontally on this container column (e.g. GXYU 509070 4). "
-            "Output ONLY the letters and digits, separated by spaces. Do not output words or explanations."
+            "You are an industrial container OCR system. Read all container markings on this image: the container owner code, serial number, check digit, and ISO size-type code or feet markings (e.g. TIIU 507766 9 45G1 or MSCU 654602 1 22G1). "
+            "Output the letters and digits separated by spaces. Do not output explanations."
         )
         log.info(f'oLmOCR model loaded successfully on {self.device}.')
 
@@ -137,9 +204,9 @@ class OlmOCREngine:
             if not output_text:
                 return OCRRead('', 0.0)
 
-            # Strip conversational text (e.g. "The container number is GXYU 509070 4")
+            # Strip conversational text if model produced extra narrative
             cleaned = output_text.replace('\n', ' ').replace('-', ' ')
-            code_match = re.search(r'([A-Z]{3,4}\s*[0-9]{6,7})', cleaned.upper())
+            code_match = re.search(r'([A-Z]{3,4}(?:[\s-]*[0-9]){6,7}(?:[\s-]*[1-4LMN][0-9][A-Z0-9]{2})?)', cleaned.upper())
             if code_match:
                 output_text = code_match.group(1).strip()
             else:

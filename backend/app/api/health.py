@@ -14,11 +14,13 @@ def health(request: Request):
         database = 'UNAVAILABLE'
     cameras = runtime.camera_status()
     enabled = [c for c in cameras if c['enabled']]
+    active = [c for c in enabled if c.get('active_source_id') or c.get('video') or c.get('status') == 'ONLINE']
     spool = runtime.ocr_store.status()
     ready = database == 'READY' and not request.app.state.startup_error and not runtime.last_processing_error and not runtime.ocr_spool_error and not spool['failed']
     if runtime.settings.pipeline_enabled:
         ready = ready and runtime.model_status['detector'] == 'READY' and runtime.model_status['ocr'] == 'READY'
-        ready = ready and bool(enabled) and all(c['status'] == 'ONLINE' or c['playback_status'] in ('READY', 'COMPLETED', 'PAUSED') for c in enabled)
+        if active:
+            ready = ready and all(c['status'] == 'ONLINE' or c['playback_status'] in ('READY', 'COMPLETED', 'PAUSED') for c in active)
     return JSONResponse({'status': 'READY' if ready else 'DEGRADED', 'database': database,
                          'pipeline_enabled': runtime.settings.pipeline_enabled,
                          'site': None, 'admin': None,

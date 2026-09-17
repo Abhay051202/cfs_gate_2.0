@@ -108,20 +108,22 @@ export class AppComponent {
     window.location.hash = 'events';
   }
 
-  uploadVideo({id, file}: {id: string; file: File}) {
+  uploadVideo({id, file, syncLane}: {id: string; file: File; syncLane?: boolean}) {
     if (this.uploads()[id]?.busy) return;
     const maximum = this.health()?.max_upload_mb ?? 2048;
     if (!/\.(mp4|avi|mov|mkv|webm|m4v)$/i.test(file.name) || file.size > maximum * 1024 * 1024) {
       this.setUpload(id, {busy: false, progress: 0, error: true, message: `Choose a supported video smaller than ${maximum} MB.`}); return;
     }
-    this.setUpload(id, {busy: true, progress: 0, error: false, message: 'Uploading video…'});
-    this.api.uploadVideo(id, file).pipe(takeUntilDestroyed(this.destroy)).subscribe({
+    this.setUpload(id, {busy: true, progress: 0, error: false, message: syncLane ? 'Syncing video to all cameras in lane…' : 'Uploading video…'});
+    this.api.uploadVideo(id, file, !!syncLane).pipe(takeUntilDestroyed(this.destroy)).subscribe({
       next: event => {
         if (event.type === HttpEventType.UploadProgress) {
           const progress = Math.round(100 * event.loaded / (event.total || file.size));
-          this.setUpload(id, {busy: true, progress, error: false, message: progress === 100 ? 'Checking video…' : `Uploading ${progress}%`});
+          this.setUpload(id, {busy: true, progress, error: false, message: progress === 100 ? 'Configuring cameras…' : `Uploading ${progress}%`});
         } else if (event.type === HttpEventType.Response) {
-          this.setUpload(id, {busy: false, progress: 100, error: false, message: 'Ready. Press Play to begin.'}); this.refresh.next();
+          this.setUpload(id, {busy: false, progress: 100, error: false, message: syncLane ? 'All lane cameras configured! Press Play to start.' : 'Ready. Press Play to begin.'});
+          this.notice.set(syncLane ? 'Video synchronized to all lane cameras.' : 'Video uploaded.');
+          this.refresh.next();
         }
       },
       error: (error: HttpErrorResponse) => this.setUpload(id, {busy: false, progress: 0, error: true, message: this.errorMessage(error, 'Upload failed. Please try again.')})
@@ -133,6 +135,12 @@ export class AppComponent {
     this.api.playback(id, action).pipe(takeUntilDestroyed(this.destroy)).subscribe({
       next: () => { this.controlsBusy.update(value => ({...value, [id]: false})); this.refresh.next(); },
       error: (error: HttpErrorResponse) => { this.controlsBusy.update(value => ({...value, [id]: false})); this.notice.set(this.errorMessage(error, 'Playback control failed.')); }
+    });
+  }
+  lanePlayback(gateId: string, action: PlaybackAction) {
+    this.api.lanePlayback(gateId, action).pipe(takeUntilDestroyed(this.destroy)).subscribe({
+      next: () => { this.notice.set(`Gate ${gateId} cameras updated: ${action}.`); this.refresh.next(); },
+      error: (error: HttpErrorResponse) => this.notice.set(this.errorMessage(error, 'Lane playback failed.'))
     });
   }
   selectCamera({id, sourceId}: {id: string; sourceId: string}) {

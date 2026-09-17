@@ -130,3 +130,31 @@ def test_manifest_path_cannot_escape_upload_directory(tmp_path):
     library = VideoLibrary(tmp_path / 'uploads')
     with pytest.raises(ValueError):
         library.path('../outside.mp4')
+
+
+def test_lane_video_sync_and_playback(settings, repository, video_bytes):
+    configs = [
+        CameraConfig(id='gate-in-1', name='Gate IN 1', gate_id='lane-in', source_env='CAM1'),
+        CameraConfig(id='gate-in-2', name='Gate IN 2', gate_id='lane-in', source_env='CAM2'),
+        CameraConfig(id='gate-in-3', name='Gate IN 3', gate_id='lane-in', source_env='CAM3'),
+        CameraConfig(id='gate-in-4', name='Gate IN 4', gate_id='lane-in', source_env='CAM4'),
+    ]
+    with TestClient(create_app(settings, repository.db, configs)) as client:
+        # Upload with sync_lane=true
+        resp = client.post('/api/cameras/gate-in-1/video?sync_lane=true', content=video_bytes,
+                           headers={'Content-Type': 'application/octet-stream', 'X-Filename': 'container.avi'})
+        assert resp.status_code == 200
+        assert resp.json()['sync_lane'] is True
+
+        # Check that all 4 cameras in lane-in now have this video assigned
+        cams = client.get('/api/cameras').json()
+        assert len(cams) == 4
+        for c in cams:
+            assert c['source_type'] == 'file'
+            assert c['video']['filename'] == 'container.avi'
+            assert c['playback_status'] == 'READY'
+
+        # Play all cameras in lane-in simultaneously
+        play_resp = client.post('/api/lanes/lane-in/playback', json={'action': 'play'})
+        assert play_resp.status_code == 200
+        assert play_resp.json()['gate_id'] == 'lane-in'

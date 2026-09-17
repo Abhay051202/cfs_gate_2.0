@@ -30,32 +30,75 @@ import { EventDetail } from './gate-api.service';
           </div>
         </div>
 
-        <div class="event-hero-card">
+        <div class="event-hero-card" [class.twin-hero]="item.is_twin">
           <div class="hero-main">
-            <div class="hero-label">CONTAINER IDENTIFICATION & EVIDENCE</div>
-            <h1 class="hero-container-title">
-              <span class="container-badge mono">{{ item.container_number || 'UNCONFIRMED / REVIEW NEEDED' }}</span>
-              <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="item.status !== 'CONFIRMED'">
-                {{ item.status.replaceAll('_', ' ') }}
-              </span>
-              <span class="movement-pill">{{ item.event_type }}</span>
-              @if (item.container_size) {
-                <span class="size-pill feet">📏 {{ item.container_size }}{{ item.size_code ? ' (' + item.size_code + ')' : '' }}</span>
+            <div class="hero-label">
+              @if (item.is_twin) {
+                <span class="twin-header-pill">TWIN 20FT CONTAINER CHASSIS (2x 20FT)</span>
+              } @else {
+                CONTAINER IDENTIFICATION & EVIDENCE
               }
-              @if (hasFeetDetection(item)) {
-                <span class="feet-pill">🦶 FEET DETECTED</span>
-              }
-            </h1>
-
-            <div class="hero-meta-row">
-              <span class="meta-item"><strong>Lane:</strong> {{ item.gate_id }}</span>
-              <span class="meta-dot">·</span>
-              <span class="meta-item"><strong>Time:</strong> {{ item.timestamp | date:'medium' }}</span>
-              <span class="meta-dot">·</span>
-              <span class="meta-item"><strong>Snapshots:</strong> {{ item.snapshots.length }} viewpoints</span>
-              <span class="meta-dot">·</span>
-              <span class="meta-item mono id-meta"><strong>ID:</strong> {{ item.id }}</span>
             </div>
+
+            @if (item.is_twin) {
+              <div class="twin-hero-boxes">
+                <!-- Front Container -->
+                <div class="twin-box-card">
+                  <div class="twin-box-header">
+                    <span class="slot-tag front">FRONT CONTAINER (SLOT 1)</span>
+                    <span class="size-pill feet">📏 20 FT {{ item.size_code ? '(' + item.size_code + ')' : '' }}</span>
+                  </div>
+                  <div class="hero-container-title">
+                    <span class="container-badge mono">{{ item.container_number || 'UNCONFIRMED' }}</span>
+                  </div>
+                </div>
+
+                <!-- Rear Container -->
+                <div class="twin-box-card">
+                  <div class="twin-box-header">
+                    <span class="slot-tag rear">REAR CONTAINER (SLOT 2)</span>
+                    <span class="size-pill feet">📏 20 FT {{ item.size_code_2 ? '(' + item.size_code_2 + ')' : '' }}</span>
+                  </div>
+                  <div class="hero-container-title">
+                    <span class="container-badge mono">{{ item.container_number_2 || 'UNCONFIRMED' }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="hero-meta-row twin-meta-row">
+                <span class="status-pill confirmed">{{ item.status.replaceAll('_', ' ') }}</span>
+                <span class="movement-pill">{{ item.event_type }}</span>
+                <span class="meta-item"><strong>Lane:</strong> {{ item.gate_id }}</span>
+                <span class="meta-dot">·</span>
+                <span class="meta-item"><strong>Time:</strong> {{ item.timestamp | date:'medium' }}</span>
+                <span class="meta-dot">·</span>
+                <span class="meta-item mono id-meta"><strong>ID:</strong> {{ item.id }}</span>
+              </div>
+            } @else {
+              <h1 class="hero-container-title">
+                <span class="container-badge mono">{{ item.container_number || 'UNCONFIRMED / REVIEW NEEDED' }}</span>
+                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="item.status !== 'CONFIRMED'">
+                  {{ item.status.replaceAll('_', ' ') }}
+                </span>
+                <span class="movement-pill">{{ item.event_type }}</span>
+                @if (item.container_size) {
+                  <span class="size-pill feet">📏 {{ item.container_size }}{{ item.size_code ? ' (' + item.size_code + ')' : '' }}</span>
+                }
+                @if (hasFeetDetection(item)) {
+                  <span class="feet-pill">🦶 FEET DETECTED</span>
+                }
+              </h1>
+
+              <div class="hero-meta-row">
+                <span class="meta-item"><strong>Lane:</strong> {{ item.gate_id }}</span>
+                <span class="meta-dot">·</span>
+                <span class="meta-item"><strong>Time:</strong> {{ item.timestamp | date:'medium' }}</span>
+                <span class="meta-dot">·</span>
+                <span class="meta-item"><strong>Snapshots:</strong> {{ item.snapshots.length }} viewpoints</span>
+                <span class="meta-dot">·</span>
+                <span class="meta-item mono id-meta"><strong>ID:</strong> {{ item.id }}</span>
+              </div>
+            }
           </div>
         </div>
 
@@ -145,15 +188,76 @@ import { EventDetail } from './gate-api.service';
           <div class="evidence-right">
             <div class="panel-card">
               <div class="panel-card-title">
-                <h3>Captured Multi-Camera Snapshots</h3>
-                <span class="badge">{{ item.snapshots.length }} images</span>
+                <h3>Multi-Camera Snapshots & Proof</h3>
+                <span class="badge">{{ item.snapshots.length }} viewpoints</span>
               </div>
+
+              @if (item.is_twin) {
+                <div class="twin-proof-grid">
+                  <!-- Front Container Proof Card -->
+                  @if (getFrontSnapshot(item); as frontSnap) {
+                    <div class="primary-proof-card twin-proof-card front-proof">
+                      <div class="proof-header front-header">
+                        <span class="proof-badge">FRONT (SLOT 1): <strong class="mono">{{ item.container_number || 'PENDING OCR' }}</strong></span>
+                        <span class="proof-cam mono">{{ frontSnap.camera_id }}</span>
+                      </div>
+                      <div class="proof-img-wrap">
+                        <img [src]="'/api/snapshots/' + frontSnap.id" [alt]="'Front container proof from ' + frontSnap.camera_id">
+                      </div>
+                      <div class="proof-caption">
+                        <span><strong class="mono">{{ item.container_number || 'Front Container' }}</strong> · {{ frontSnap.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
+                        <a [href]="'/api/snapshots/' + frontSnap.id" target="_blank" class="view-raw-link">Full resolution ↗</a>
+                      </div>
+                    </div>
+                  }
+
+                  <!-- Rear Container Proof Card -->
+                  @if (getRearSnapshot(item); as rearSnap) {
+                    <div class="primary-proof-card twin-proof-card rear-proof">
+                      <div class="proof-header rear-header">
+                        <span class="proof-badge">REAR (SLOT 2): <strong class="mono">{{ item.container_number_2 || 'PENDING OCR' }}</strong></span>
+                        <span class="proof-cam mono">{{ rearSnap.camera_id }}</span>
+                      </div>
+                      <div class="proof-img-wrap">
+                        <img [src]="'/api/snapshots/' + rearSnap.id" [alt]="'Rear container proof from ' + rearSnap.camera_id">
+                      </div>
+                      <div class="proof-caption">
+                        <span><strong class="mono">{{ item.container_number_2 || 'Rear Container' }}</strong> · {{ rearSnap.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
+                        <a [href]="'/api/snapshots/' + rearSnap.id" target="_blank" class="view-raw-link">Full resolution ↗</a>
+                      </div>
+                    </div>
+                  }
+                </div>
+              } @else {
+                @if (getPrimarySnapshot(item); as primary) {
+                  <div class="primary-proof-card">
+                    <div class="proof-header">
+                      <span class="proof-badge">PRIMARY CONTAINER PROOF</span>
+                      <span class="proof-cam mono">{{ primary.camera_id }}</span>
+                    </div>
+                    <div class="proof-img-wrap">
+                      <img [src]="'/api/snapshots/' + primary.id" [alt]="'Container proof from ' + primary.camera_id">
+                    </div>
+                    <div class="proof-caption">
+                      <span><strong>{{ item.container_number || 'Detected Container' }}</strong> · {{ primary.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
+                      <a [href]="'/api/snapshots/' + primary.id" target="_blank" class="view-raw-link">Full resolution ↗</a>
+                    </div>
+                  </div>
+                }
+              }
+
+              <h4 class="multi-angle-title">All Gate Camera Angles ({{ item.snapshots.length }})</h4>
               <div class="snapshots-grid">
                 @for (s of item.snapshots; track s.id) {
-                  <figure class="snapshot-card">
+                  <figure class="snapshot-card" [class.is-primary]="s.id === item.primary_snapshot_id || s.id === item.rear_snapshot_id">
                     <div class="snapshot-img-wrap">
                       <img [src]="'/api/snapshots/' + s.id" [alt]="'Snapshot from ' + s.camera_id" loading="lazy">
                       <span class="camera-tag">{{ s.camera_id }}</span>
+                      @if (s.id === item.primary_snapshot_id) {
+                        <span class="primary-tag">FRONT PROOF</span>
+                      } @else if (s.id === item.rear_snapshot_id) {
+                        <span class="primary-tag rear-tag">REAR PROOF</span>
+                      }
                     </div>
                     <figcaption>
                       <span class="snap-time">{{ s.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
@@ -179,6 +283,36 @@ export class EventDetailComponent {
 
   toggleJson() {
     this.showJson.update(v => !v);
+  }
+
+  getPrimarySnapshot(item: EventDetail) {
+    if (!item?.snapshots?.length) return null;
+    if (item.primary_snapshot_id) {
+      const found = item.snapshots.find(s => s.id === item.primary_snapshot_id);
+      if (found) return found;
+    }
+    return item.snapshots[0];
+  }
+
+  getFrontSnapshot(item: EventDetail) {
+    if (!item?.snapshots?.length) return null;
+    if (item.primary_snapshot_id) {
+      const found = item.snapshots.find(s => s.id === item.primary_snapshot_id);
+      if (found) return found;
+    }
+    const nonRear = item.snapshots.find(s => !s.image_path?.endsWith('_rear.jpg'));
+    return nonRear || item.snapshots[0];
+  }
+
+  getRearSnapshot(item: EventDetail) {
+    if (!item?.snapshots?.length) return null;
+    if (item.rear_snapshot_id) {
+      const found = item.snapshots.find(s => s.id === item.rear_snapshot_id);
+      if (found) return found;
+    }
+    const rear = item.snapshots.find(s => s.image_path?.endsWith('_rear.jpg'));
+    if (rear) return rear;
+    return item.snapshots.length > 1 ? item.snapshots[1] : null;
   }
 
   hasFeetDetection(item: EventDetail | null): boolean {

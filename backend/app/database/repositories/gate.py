@@ -31,7 +31,7 @@ class GateRepository:
                 current.enabled = camera.enabled
                 current.configuration = camera.model_dump(mode='json')
 
-    def save_observation(self, obs: Observation, snapshots, dedup_seconds: float, additional_frames: dict | None = None):
+    def save_observation(self, obs: Observation, snapshots, dedup_seconds: float, additional_frames: dict | None = None, ongoing_event_id=None):
         """One writer per service; DB uniqueness also protects retried track writes."""
         created_paths = []
         try:
@@ -42,42 +42,104 @@ class GateRepository:
                 number = obs.ocr.normalized_text if obs.confirmed else None
                 delta = timedelta(seconds=dedup_seconds)
                 existing = None
+
+                direction_match = (
+                    (GateEvent.event_type == obs.direction) | (GateEvent.event_type == 'UNKNOWN')
+                    if obs.direction != 'UNKNOWN'
+                    else True
+                )
+
+                is_rear_slot = getattr(obs, 'slot_position', 'FRONT') == 'REAR' or obs.origin_key.endswith(':rear')
+
                 if number:
                     existing = session.scalar(select(GateEvent).where(
                         GateEvent.gate_id == obs.gate_id,
-                        GateEvent.container_number == number,
-                        GateEvent.event_type == obs.direction,
+                        (GateEvent.container_number == number) |
+                        (GateEvent.container_number_2 == number) |
+                        (GateEvent.container_number.is_(None)),
+                        direction_match,
                         GateEvent.timestamp >= obs.detection.frame_timestamp - delta,
                         GateEvent.timestamp <= obs.detection.frame_timestamp + delta,
                     ).order_by(GateEvent.timestamp.desc()))
-                    if not existing:
-                        unconfirmed = session.scalar(select(GateEvent).where(
-                            GateEvent.gate_id == obs.gate_id,
-                            GateEvent.container_number.is_(None),
-                            GateEvent.event_type == obs.direction,
-                            GateEvent.timestamp >= obs.detection.frame_timestamp - delta,
-                            GateEvent.timestamp <= obs.detection.frame_timestamp + delta,
-                        ).order_by(GateEvent.timestamp.desc()))
-                        if unconfirmed:
-                            unconfirmed.container_number = number
-                            unconfirmed.status = 'CONFIRMED'
-                            existing = unconfirmed
+                    if existing:
+                        if is_rear_slot:
+                            existing.is_twin = True
+                            if (number != existing.container_number or not existing.container_number) and (not existing.container_number_2 or obs.confirmed):
+                                existing.container_number_2 = number
+                                existing.iso_code_2 = getattr(obs.ocr, 'size_type', None) or '22G1'
+                        else:
+                            if (number != existing.container_number_2 or not existing.container_number_2) and (not existing.container_number or obs.confirmed):
+                                existing.container_number = number
+                                existing.iso_code_1 = getattr(obs.ocr, 'size_type', None)
+                        if obs.confirmed:
+                            existing.status = 'CONFIRMED'
+                        if existing.event_type == 'UNKNOWN' and obs.direction != 'UNKNOWN':
+                            existing.event_type = obs.direction
                 else:
                     existing = session.scalar(select(GateEvent).where(
                         GateEvent.gate_id == obs.gate_id,
-                        GateEvent.event_type == obs.direction,
+                        direction_match,
                         GateEvent.timestamp >= obs.detection.frame_timestamp - delta,
                         GateEvent.timestamp <= obs.detection.frame_timestamp + delta,
                     ).order_by(GateEvent.timestamp.desc()))
+                    if existing and existing.event_type == 'UNKNOWN' and obs.direction != 'UNKNOWN':
+                        existing.event_type = obs.direction
+                if not existing and getattr(obs, 'event_id', None):
+                    active = session.get(GateEvent, obs.event_id)
+                    if active and active.gate_id == obs.gate_id:
+                        existing = active
+
+                if ongoing_event_id and not existing:
+                    active = session.get(GateEvent, ongoing_event_id)
+                    if active and active.gate_id == obs.gate_id:
+                        existing = active
+
+                if obs.origin_key.startswith('dwell:') and existing and not is_rear_slot:
+                    prior_view = session.scalar(select(DetectionRecord.id).where(
+                        DetectionRecord.event_id == existing.id,
+                        DetectionRecord.camera_id == obs.detection.camera_id,
+                        DetectionRecord.origin_key.like('dwell:%'),
+                        ~DetectionRecord.origin_key.like('%:rear'),
+                        DetectionRecord.origin_key != obs.origin_key))
+                    if prior_view:
+                        existing = None  # New cleared passage, not time-window fusion.
+
                 created = existing is None
-                event_id = existing.id if existing else str(uuid4())
+                event_id = existing.id if existing else (getattr(obs, 'event_id', None) or str(uuid4()))
+                if created and session.get(GateEvent, event_id):
+                    existing = session.get(GateEvent, event_id)
+                    created = False
+                    event_id = existing.id
+                is_twin_event = is_rear_slot or obs.origin_key.endswith(':front')
                 if created:
                     session.add(GateEvent(
                         id=event_id, gate_id=obs.gate_id, timestamp=obs.detection.frame_timestamp,
-                        container_number=number, event_type=obs.direction,
-                        status='CONFIRMED' if obs.confirmed else 'NEEDS_REVIEW',
+                        container_number=number if not is_rear_slot else None,
+                        container_number_2=number if is_rear_slot else None,
+                        iso_code_1=getattr(obs.ocr, 'size_type', None) if not is_rear_slot else None,
+                        iso_code_2=getattr(obs.ocr, 'size_type', None) if is_rear_slot else None,
+                        is_twin=is_twin_event,
+                        event_type=obs.direction,
+                        status='CONFIRMED' if (obs.confirmed and not is_twin_event) else 'NEEDS_REVIEW',
                     ))
                     session.flush()
+                else:
+                    if is_rear_slot:
+                        existing.is_twin = True
+                        if (number != existing.container_number or not existing.container_number) and (not existing.container_number_2 or obs.confirmed):
+                            existing.container_number_2 = number
+                            existing.iso_code_2 = getattr(obs.ocr, 'size_type', None) or '22G1'
+                    else:
+                        if (number != existing.container_number_2 or not existing.container_number_2) and (not existing.container_number or obs.confirmed):
+                            existing.container_number = number
+                            existing.iso_code_1 = getattr(obs.ocr, 'size_type', None)
+                        if obs.origin_key.endswith(':front'):
+                            existing.is_twin = True
+                    if existing.is_twin:
+                        if existing.container_number and existing.container_number_2:
+                            existing.status = 'CONFIRMED'
+                    elif obs.confirmed:
+                        existing.status = 'CONFIRMED'
                 detection_id = str(uuid4())
                 session.add(DetectionRecord(
                     id=detection_id, event_id=event_id, camera_id=obs.detection.camera_id,
@@ -85,8 +147,8 @@ class GateRepository:
                     class_name=obs.detection.class_name, confidence=obs.detection.confidence,
                     bbox=list(obs.detection.bbox), timestamp=obs.detection.frame_timestamp,
                 ))
-                session.flush()
-                session.add(OCRResult(id=str(uuid4()), detection_id=detection_id, **asdict(obs.ocr)))
+                ocr_data = {k: v for k, v in asdict(obs.ocr).items() if k != 'size_type'}
+                session.add(OCRResult(id=str(uuid4()), detection_id=detection_id, **ocr_data))
 
                 # Also save any concurrent detections on this frame (such as Feet!)
                 if getattr(obs, 'all_detections', None):
@@ -106,41 +168,18 @@ class GateRepository:
 
 
                 # 1. Primary snapshot for this observation
-                existing_cam_snaps = session.scalars(select(Snapshot).where(
+                snapshot_id = str(uuid4())
+                image_path = snapshots.save(snapshot_id, obs, event_id)
+                existing_path_snap = session.scalar(select(Snapshot).where(
                     Snapshot.event_id == event_id,
-                    Snapshot.camera_id == obs.detection.camera_id
-                )).all()
-                prior_detection = session.scalar(select(DetectionRecord).where(
-                    DetectionRecord.event_id == event_id,
-                    DetectionRecord.camera_id == obs.detection.camera_id,
-                    DetectionRecord.id != detection_id
+                    Snapshot.image_path == image_path
                 ))
-                same_track_recorded = session.scalar(select(DetectionRecord).where(
-                    DetectionRecord.event_id == event_id,
-                    DetectionRecord.camera_id == obs.detection.camera_id,
-                    DetectionRecord.track_id == obs.track_id,
-                    DetectionRecord.id != detection_id
-                ))
-
-                if existing_cam_snaps and not prior_detection:
-                    # Camera was previously stored as background frame from additional_frames;
-                    # upgrade it now with the actual detection bounding box!
-                    snap = existing_cam_snaps[0]
-                    new_path = snapshots.save(snap.id, obs, event_id)
-                    snap.image_path = new_path
-                    snap.timestamp = obs.detection.frame_timestamp
-                elif not existing_cam_snaps or not same_track_recorded:
-                    # First time this camera/track is recorded for this event
-                    snapshot_id = str(uuid4())
-                    image_path = snapshots.save(snapshot_id, obs, event_id)
+                if existing_path_snap:
+                    existing_path_snap.timestamp = obs.detection.frame_timestamp
+                else:
                     created_paths.append(image_path)
                     session.add(Snapshot(id=snapshot_id, event_id=event_id, camera_id=obs.detection.camera_id,
                                          image_path=image_path, timestamp=obs.detection.frame_timestamp))
-                elif obs.confirmed and existing_cam_snaps:
-                    snap = existing_cam_snaps[-1]
-                    new_path = snapshots.save(snap.id, obs, event_id)
-                    snap.image_path = new_path
-                    snap.timestamp = obs.detection.frame_timestamp
 
                 # 2. Multi-camera snapshots for all other cameras covering this gate event
                 if additional_frames:
@@ -166,56 +205,76 @@ class GateRepository:
 
                 session.add(SystemLog(id=str(uuid4()), event_id=event_id, level='INFO',
                                       event_name='gate_event_created' if created else 'gate_evidence_associated',
-                                      context={'camera_id': obs.detection.camera_id, 'gate_id': obs.gate_id}))
-
-            try:
-                full_event = self.event(event_id)
-                if full_event and hasattr(snapshots, 'save_event_json'):
-                    snapshots.save_event_json(event_id, full_event)
-            except Exception:
-                pass
-
+                                      context={'camera_id': obs.detection.camera_id,
+                                               'message': f'Container {number} confirmed on lane {obs.gate_id}'
+                                               if obs.confirmed else f'Observation for {number or "unidentified container"} saved'}))
+            if event_id and snapshots:
+                try:
+                    ev_dict = self.event(event_id)
+                    if ev_dict:
+                        snapshots.save_event_json(event_id, ev_dict)
+                except Exception:
+                    pass
             return event_id, created
         except Exception:
-            for p in created_paths:
+            for path in created_paths:
                 try:
-                    snapshots.remove(p)
+                    snapshots.remove(path)
                 except Exception:
                     pass
             raise
 
-    def events(self, limit=50, offset=0, container=None, camera_id=None, event_type=None, status=None):
-        query = select(GateEvent)
-        if container:
-            query = query.where(GateEvent.container_number == container.upper())
-        if camera_id:
-            query = query.where(GateEvent.id.in_(select(DetectionRecord.event_id).where(DetectionRecord.camera_id == camera_id)))
-        if event_type:
-            query = query.where(GateEvent.event_type == event_type)
-        if status:
-            query = query.where(GateEvent.status == status)
+    def events(self, limit=50, offset=0, container=None, camera_id=None, event_type=None, status=None, start_date=None, end_date=None):
         with self.db.sessions() as session:
+            query = select(GateEvent)
+            if container:
+                query = query.where((GateEvent.container_number == container.upper()) | (GateEvent.container_number_2 == container.upper()))
+            if camera_id:
+                query = query.where(GateEvent.id.in_(select(DetectionRecord.event_id).where(DetectionRecord.camera_id == camera_id)))
+            if event_type:
+                query = query.where(GateEvent.event_type == event_type)
+            if status:
+                query = query.where(GateEvent.status == status)
+            if start_date:
+                query = query.where(GateEvent.timestamp >= start_date)
+            if end_date:
+                query = query.where(GateEvent.timestamp <= end_date)
             total = session.scalar(select(func.count()).select_from(query.subquery()))
-            items = [serialize(e) for e in session.scalars(query.order_by(GateEvent.timestamp.desc(), GateEvent.id).limit(limit).offset(offset))]
+            rows = session.scalars(query.order_by(GateEvent.timestamp.desc()).limit(limit).offset(offset)).all()
+            items = [serialize(r) for r in rows]
             from app.ocr.validator import parse_feet_size
             import re
             for item in items:
-                dets = list(session.scalars(select(DetectionRecord).where(DetectionRecord.event_id == item['id'])))
-                has_feet = any(d.class_name.lower() == 'feet' for d in dets)
-                ocrs = list(session.scalars(select(OCRResult).where(OCRResult.detection_id.in_([d.id for d in dets])))) if dets else []
+                has_feet = session.scalar(select(DetectionRecord.id).where(
+                    DetectionRecord.event_id == item['id'],
+                    func.lower(DetectionRecord.class_name) == 'feet'
+                )) is not None
+                ocr_texts = session.scalars(select(OCRResult.normalized_text).join(DetectionRecord).where(
+                    DetectionRecord.event_id == item['id']
+                )).all()
+                from app.ocr.validator import extract_iso_size_code
                 parsed_size = None
                 size_code = None
-                for o in ocrs:
-                    text_to_check = f"{o.normalized_text} {o.raw_text}"
-                    parsed = parse_feet_size(text_to_check)
-                    if parsed:
-                        parsed_size = parsed
-                        m = re.search(r'(?<![A-Z0-9])([1-4LMN][0-9][GVRHBUTP][0-9A-Z])(?![A-Z0-9])', text_to_check.upper())
-                        if m:
-                            size_code = m.group(1)
+                for text in ocr_texts:
+                    iso_c, human_s = extract_iso_size_code(text)
+                    if iso_c:
+                        size_code = iso_c
+                    if human_s:
+                        parsed_size = human_s
+                    if size_code and parsed_size:
                         break
-                item['container_size'] = parsed_size or ('FEET' if has_feet else None)
-                item['size_code'] = size_code
+                if not size_code and item.get('iso_code_1'):
+                    iso_c, human_s = extract_iso_size_code(item.get('iso_code_1'))
+                    size_code = iso_c or item.get('iso_code_1')
+                    parsed_size = parsed_size or human_s
+                if item.get('is_twin'):
+                    item['container_size'] = '20 FT'
+                    item['container_size_2'] = '20 FT'
+                    item['size_code'] = item.get('iso_code_1') or '22G1'
+                    item['size_code_2'] = item.get('iso_code_2') or '22G1'
+                else:
+                    item['container_size'] = parsed_size or ('40 FT HC' if size_code == '45G1' else ('40 FT' if (size_code or '').startswith('4') else ('20 FT' if (size_code or '').startswith('2') else ('FEET' if has_feet else None))))
+                    item['size_code'] = size_code or item.get('iso_code_1')
             return {'items': items, 'total': total, 'limit': limit, 'offset': offset}
 
     def event(self, event_id):
@@ -227,26 +286,44 @@ class GateRepository:
             detections = list(session.scalars(select(DetectionRecord).where(DetectionRecord.event_id == event_id)))
             result['detections'] = [serialize(d) for d in detections]
             result['ocr_results'] = [serialize(o) for o in session.scalars(select(OCRResult).where(
-                OCRResult.detection_id.in_([d.id for d in detections]))) ]
-            result['snapshots'] = [serialize(s) for s in session.scalars(select(Snapshot).where(Snapshot.event_id == event_id))]
+                OCRResult.detection_id.in_([d.id for d in detections])))]
+            snapshots_list = [serialize(s) for s in session.scalars(select(Snapshot).where(Snapshot.event_id == event_id))]
+            primary_cam = detections[0].camera_id if detections else (snapshots_list[0]['camera_id'] if snapshots_list else None)
+            front_snap = next((s for s in snapshots_list if not (s.get('image_path') or '').endswith('_rear.jpg') and s['camera_id'] == primary_cam), (snapshots_list[0] if snapshots_list else None))
+            rear_snap = next((s for s in snapshots_list if (s.get('image_path') or '').endswith('_rear.jpg')), None)
+            result['primary_camera_id'] = primary_cam
+            result['primary_snapshot_id'] = front_snap['id'] if front_snap else None
+            result['rear_snapshot_id'] = rear_snap['id'] if rear_snap else None
+            result['snapshots'] = snapshots_list
             
-            from app.ocr.validator import parse_feet_size
-            import re
+            from app.ocr.validator import extract_iso_size_code
             container_size = None
             size_code = None
             for ocr in result['ocr_results']:
                 text_to_check = f"{ocr.get('normalized_text', '')} {ocr.get('raw_text', '')}"
-                parsed = parse_feet_size(text_to_check)
-                if parsed:
-                    container_size = parsed
-                    m = re.search(r'(?<![A-Z0-9])([1-4LMN][0-9][GVRHBUTP][0-9A-Z])(?![A-Z0-9])', text_to_check.upper())
-                    if m:
-                        size_code = m.group(1)
+                iso_c, human_s = extract_iso_size_code(text_to_check)
+                if iso_c:
+                    size_code = iso_c
+                if human_s:
+                    container_size = human_s
+                if size_code and container_size:
                     break
+            
+            if not size_code and result.get('iso_code_1'):
+                iso_c, human_s = extract_iso_size_code(result.get('iso_code_1'))
+                size_code = iso_c or result.get('iso_code_1')
+                container_size = container_size or human_s
+
             if not container_size and any(d.get('class_name', '').lower() == 'feet' for d in result['detections']):
                 container_size = 'FEET DETECTED'
-            result['container_size'] = container_size
-            result['size_code'] = size_code
+            if result.get('is_twin'):
+                result['container_size'] = '20 FT'
+                result['container_size_2'] = '20 FT'
+                result['size_code'] = result.get('iso_code_1') or '22G1'
+                result['size_code_2'] = result.get('iso_code_2') or '22G1'
+            else:
+                result['container_size'] = container_size or ('40 FT HC' if size_code == '45G1' else ('40 FT' if (size_code or '').startswith('4') else ('20 FT' if (size_code or '').startswith('2') else None)))
+                result['size_code'] = size_code or result.get('iso_code_1')
             return result
 
     def ocr_results(self, limit=50, offset=0):

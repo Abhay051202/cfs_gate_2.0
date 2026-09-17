@@ -13,13 +13,33 @@ export interface Camera {
   video: {filename: string; size_bytes: number; duration_seconds: number | null; active: boolean} | null;
   active_source_id: string | null; active_source_name: string | null;
 }
-export interface CameraSource { id: string; name: string; configured: boolean; discovered?: boolean; connection_hint?: string; }
+export interface CameraSource { id: string; name: string; host?: string; configured: boolean; discovered?: boolean; connection_hint?: string; }
 export interface DiscoveryStatus { state: string; found: number; message: string; }
-export interface GateEvent { id: string; gate_id: string; timestamp: string; container_number: string | null; event_type: string; status: string; container_size?: string | null; size_code?: string | null; }
+export interface GateEvent {
+  id: string;
+  gate_id: string;
+  timestamp: string;
+  container_number: string | null;
+  event_type: string;
+  status: string;
+  container_size?: string | null;
+  size_code?: string | null;
+  is_twin?: boolean;
+  container_number_2?: string | null;
+  size_code_2?: string | null;
+  container_size_2?: string | null;
+}
 export interface Detection { id?: string; camera_id: string; class_name: string; confidence: number; bbox: number[]; timestamp?: string; frame_timestamp?: string; track_id?: number; }
 export interface OCR { id: string; raw_text: string; normalized_text: string; confidence: number; validation_status: string; }
-export interface Snapshot { id: string; camera_id: string; timestamp: string; }
-export interface EventDetail extends GateEvent { detections: Detection[]; ocr_results: OCR[]; snapshots: Snapshot[]; }
+export interface Snapshot { id: string; camera_id: string; timestamp: string; image_path?: string; }
+export interface EventDetail extends GateEvent {
+  detections: Detection[];
+  ocr_results: OCR[];
+  snapshots: Snapshot[];
+  primary_camera_id?: string;
+  primary_snapshot_id?: string;
+  rear_snapshot_id?: string;
+}
 export interface EventPage { items: GateEvent[]; total: number; offset: number; limit: number; }
 export interface Health { status: string; database: string; pipeline_enabled: boolean; online_cameras: number; enabled_cameras: number; models: {detector: string; ocr: string; error_type?: string | null}; processing_error: string | null; startup_error: string | null; max_upload_mb: number; }
 export interface Metrics { cpu_percent: number; memory_percent: number; gpu_utilization_percent: number | null; ocr_queue_depth: number; latencies: Record<string, {p50_ms: number; p95_ms: number}>; inference_fps: Record<string, number>;
@@ -51,13 +71,21 @@ export class GateApi {
   eventJsonUrl(id: string) { return `/api/gate-events/${encodeURIComponent(id)}/json`; }
   eventJson(id: string) { return this.http.get<Record<string, unknown>>(`/api/gate-events/${encodeURIComponent(id)}/json`); }
 
-  uploadVideo(id: string, file: File) {
-    return this.http.request(new HttpRequest('POST', `/api/cameras/${encodeURIComponent(id)}/video`, file, {
+  uploadVideo(id: string, file: File, syncLane: boolean = false) {
+    const url = `/api/cameras/${encodeURIComponent(id)}/video` + (syncLane ? '?sync_lane=true' : '');
+    return this.http.request(new HttpRequest('POST', url, file, {
       reportProgress: true,
       headers: new HttpHeaders({'Content-Type': 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name)})
     }));
   }
   playback(id: string, action: PlaybackAction) { return this.http.post(`/api/cameras/${encodeURIComponent(id)}/playback`, {action}); }
+  lanePlayback(gateId: string, action: PlaybackAction) { return this.http.post(`/api/lanes/${encodeURIComponent(gateId)}/playback`, {action}); }
   playAll() { return this.http.post<{results: {camera_id: string; success: boolean}[]}>('/api/videos/play-all', {}); }
   startProcessing() { return this.http.post('/api/processing/start', {}); }
+  lensStatus(id: string) { return this.http.get<{supported: boolean; status?: string; zoom?: number; focus?: number; zoom_steps?: number; focus_steps?: number}>(`/api/cameras/${encodeURIComponent(id)}/lens/status`); }
+  lensZoom(id: string, action: 'step_in' | 'step_out' | 'in' | 'out' | 'stop') { return this.http.post<{success: boolean}>(`/api/cameras/${encodeURIComponent(id)}/lens/zoom`, {action}); }
+  lensFocus(id: string, action: 'step_far' | 'step_near' | 'far' | 'near' | 'stop') { return this.http.post<{success: boolean}>(`/api/cameras/${encodeURIComponent(id)}/lens/focus`, {action}); }
+  lensAutoFocus(id: string) { return this.http.post<{success: boolean}>(`/api/cameras/${encodeURIComponent(id)}/lens/autofocus`, {}); }
+  getExposure(id: string) { return this.http.get<{supported: boolean; mode?: string; shutter_speed?: string; shutter_ms?: number}>(`/api/cameras/${encodeURIComponent(id)}/exposure`); }
+  setExposure(id: string, shutter: string, mode: string = 'auto') { return this.http.post<{success: boolean; shutter_speed?: string; mode?: string}>(`/api/cameras/${encodeURIComponent(id)}/exposure`, {shutter, mode}); }
 }

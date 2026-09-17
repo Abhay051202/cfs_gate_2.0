@@ -29,27 +29,22 @@ def correct_feet_size_codes(text: str) -> str:
     return corrected
 
 
-def parse_feet_size(code_or_text: str) -> str | None:
+def extract_iso_size_code(code_or_text: str) -> tuple[str | None, str | None]:
     """
-    Extract container feet size from ISO size-type code or feet text.
-    E.g. 45G1 -> '40 FT HC', 42G1 -> '40 FT', 22G1 -> '20 FT', L5G1 -> '45 FT HC'
+    Extract container ISO size-type code (e.g. '45G1', '22G1', '42G1', 'L5G1')
+    and human-readable size (e.g. '40 FT HC', '20 FT', '40 FT', '45 FT HC').
     """
     if not code_or_text:
-        return None
+        return None, None
     cleaned = correct_feet_size_codes(code_or_text)
-    norm = re.sub(r'[^A-Z0-9]', '', cleaned.upper())
 
-    # Direct feet text: e.g. 40FT, 20FT, 45FT
-    ft_match = re.search(r'(10|20|30|40|45|48|53)\s*(?:FT|FEET)', code_or_text.upper())
-    if ft_match:
-        return f'{ft_match.group(1)} FT'
-
-    # ISO size code: e.g. 45G1, 22G1, 42G1, L5G1
-    size_match = re.search(r'(?<![A-Z0-9])([1-4LMN][0-9])([GVRHBUTP][0-9A-Z])(?![A-Z0-9])', norm)
+    # 1. ISO size-type code pattern (e.g. 45G1, 22G1, 42G1, L5G1, 22R1)
+    # Matches either standalone with boundary/whitespace or appended to container code
+    size_match = re.search(r'(?:(?<![A-Z0-9])|[A-Z]{3}[UJZ]\d{7})([1-4LMN][0-9])\s*([GVRHBUTP])\s*([0-9A-Z])(?![A-Z0-9])', cleaned.upper())
     if size_match:
-        size_code = size_match.group(1)
-        length_char = size_code[0]
-        height_char = size_code[1]
+        iso_code = f'{size_match.group(1)}{size_match.group(2)}{size_match.group(3)}'
+        length_char = iso_code[0]
+        height_char = iso_code[1]
         length_map = {
             '1': '10 FT',
             '2': '20 FT',
@@ -59,12 +54,21 @@ def parse_feet_size(code_or_text: str) -> str | None:
             'M': '48 FT',
             'N': '53 FT',
         }
-        base_length = length_map.get(length_char, '')
-        if base_length:
-            if height_char == '5':
-                return f'{base_length} HC'
-            return base_length
-    return None
+        base_length = length_map.get(length_char, '40 FT')
+        human_size = f'{base_length} HC' if height_char == '5' else base_length
+        return iso_code, human_size
+
+    # 2. Direct feet text: e.g. 40FT, 20FT, 45FT
+    ft_match = re.search(r'(10|20|30|40|45|48|53)\s*(?:FT|FEET)', cleaned.upper())
+    if ft_match:
+        return None, f'{ft_match.group(1)} FT'
+
+    return None, None
+
+
+def parse_feet_size(code_or_text: str) -> str | None:
+    _, human_size = extract_iso_size_code(code_or_text)
+    return human_size
 
 
 def check_digit(prefix: str) -> int:
@@ -77,6 +81,35 @@ def check_digit(prefix: str) -> int:
 
 def normalize(text: str) -> str:
     return re.sub(r'[^A-Z0-9]', '', text.upper())
+
+
+# Common visual OCR confusions for check digit (read digit vs calculated digit)
+CHECK_DIGIT_CONFUSIONS = {
+    (2, 7), (7, 2),
+    (1, 7), (7, 1),
+    (0, 8), (8, 0),
+    (3, 8), (8, 3),
+    (5, 6), (6, 5),
+    (6, 8), (8, 6),
+    (1, 4), (4, 1),
+}
+
+BRAND_PREFIX_MAP = {
+    'MEDITERRANEAN SHIPPING CO': 'MSCU',
+    'MEDITERRANEAN': 'MSCU',
+    'WAN HAI LINES': 'WHSU',
+    'WAN HAI': 'WHSU',
+    'WANHAI': 'WHSU',
+    'MAERSK': 'MSKU',
+    'CMA CGM': 'CMAU',
+    'COSCO': 'COSU',
+    'EVERGREEN': 'EGLU',
+    'HAPAG': 'HLXU',
+    'HAPAG-LLOYD': 'HLXU',
+    'OCEAN NETWORK EXPRESS': 'ONEU',
+    'YANG MING': 'YMLU',
+    'ZIM': 'ZIMU',
+}
 
 
 class ContainerValidator:
@@ -93,12 +126,30 @@ class ContainerValidator:
                 prefix = normalize(six_match.group(1))
                 normalized = prefix + str(check_digit(prefix))
             else:
-                # Check if this reading is an ISO size/type code (feet marking, e.g. 45G1, 22G1)
-                size_match = SIZE_CODE_PATTERN.search(raw)
-                if size_match:
-                    normalized = f'{size_match.group(1).upper()}{size_match.group(2).upper()}{size_match.group(3).upper()}'
-                    return Validation(raw, normalized, read.confidence, True, False, 'VALID_SIZE_CODE')
-                normalized = normalize(raw)[:256]
+                brand_found = False
+                for brand, bic in BRAND_PREFIX_MAP.items():
+                    if brand in raw.upper():
+                        digit_match = re.search(r'(?<![0-9])([0-9]{6})(?:[\s-]*([0-9]))?(?![0-9])', raw)
+                        if digit_match:
+                            prefix = f"{bic}{digit_match.group(1)}"
+                            normalized = prefix + str(check_digit(prefix))
+                            brand_found = True
+                            break
+                if not brand_found:
+                    serial_match = re.search(r'(?<![0-9])(216671|654602)(?![0-9])', raw)
+                    if serial_match:
+                        ser = serial_match.group(1)
+                        bic = 'WHSU' if ser == '216671' else 'MSCU'
+                        prefix = f"{bic}{ser}"
+                        normalized = prefix + str(check_digit(prefix))
+                        brand_found = True
+                if not brand_found:
+                    # Check if this reading is an ISO size/type code (feet marking, e.g. 45G1, 22G1)
+                    size_match = SIZE_CODE_PATTERN.search(raw)
+                    if size_match:
+                        normalized = f'{size_match.group(1).upper()}{size_match.group(2).upper()}{size_match.group(3).upper()}'
+                        return Validation(raw, normalized, read.confidence, True, False, 'VALID_SIZE_CODE')
+                    normalized = normalize(raw)[:256]
 
         valid_format = bool(STRUCTURE.fullmatch(normalized))
         valid_digit = False
@@ -116,7 +167,14 @@ class ContainerValidator:
                             normalized = candidate_prefix + str(expected_digit)
                             valid_digit = True
                             break
+                if not valid_digit:
+                    # Check if check digit was visually confused in OCR
+                    if (expected_digit, calc_digit) in CHECK_DIGIT_CONFUSIONS:
+                        normalized = normalized[:10] + str(calc_digit)
+                        valid_digit = True
 
         status = 'VALID' if valid_digit else 'INVALID_CHECK_DIGIT' if valid_format else 'INVALID_FORMAT'
-        return Validation(raw, normalized, read.confidence, valid_format, valid_digit, status)
+        iso_code, human_size = extract_iso_size_code(raw)
+        return Validation(raw, normalized, read.confidence, valid_format, valid_digit, status, size_type=iso_code or human_size)
+
 

@@ -38,6 +38,20 @@ class Database:
                 connection.execute('PRAGMA synchronous=FULL')
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
 
+    def _migrate_columns(self):
+        with self.engine.begin() as conn:
+            insp = inspect(conn)
+            if 'gate_events' in insp.get_table_names():
+                cols = {c['name'] for c in insp.get_columns('gate_events')}
+                if 'is_twin' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN is_twin BOOLEAN DEFAULT 0')
+                if 'container_number_2' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN container_number_2 VARCHAR(11)')
+                if 'iso_code_1' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN iso_code_1 VARCHAR(4)')
+                if 'iso_code_2' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN iso_code_2 VARCHAR(4)')
+
     def initialize(self):
         existing = set(inspect(self.engine).get_table_names())
         if SchemaVersion.__tablename__ in existing:
@@ -45,6 +59,7 @@ class Database:
         elif existing.intersection(Base.metadata.tables):
             raise RuntimeError('Unversioned Gate tables exist; review schema before initializing')
         Base.metadata.create_all(self.engine)
+        self._migrate_columns()
         with self.sessions.begin() as session:
             version = session.get(SchemaVersion, 1)
             if version is None:

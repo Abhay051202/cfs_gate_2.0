@@ -22,8 +22,8 @@
   <div class="header-context">
     <div><small>SITE</small><span>Panvel CFS</span></div>
     <div class="admin-context">
-      <span class="avatar">N</span>
-      <span>nam11<small>Prosper Cloud Connected</small></span>
+      <span class="avatar">A</span>
+      <span>admin<small>Prosper Cloud Connected</small></span>
     </div>
   </div>
 </header>
@@ -91,6 +91,19 @@
             <p class="empty">Connecting to the Gate backend…</p>
           }
 
+          <div class="lane-actions-strip">
+            <div>
+              <strong>Gate IN (4 Cameras Synchronized)</strong>
+              <span class="subtle" style="margin-left: 10px;">Front/Top · Left · Right · Rear</span>
+            </div>
+            <div class="lane-actions-buttons">
+              <button class="primary" (click)="lanePlayback('lane-in', 'play')" [disabled]="!!error()">▶ Sync Play All IN</button>
+              <button (click)="lanePlayback('lane-in', 'pause')" [disabled]="!!error()">⏸ Pause All</button>
+              <button (click)="lanePlayback('lane-in', 'restart')" [disabled]="!!error()">↺ Restart All</button>
+              <button (click)="lanePlayback('lane-in', 'restore-camera')" [disabled]="!!error()">Use Live Cameras</button>
+            </div>
+          </div>
+
           <gate-camera-grid
             [cameras]="cameras()"
             [cameraSources]="cameraSources()"
@@ -101,6 +114,7 @@
             [busy]="controlsBusy()"
             (upload)="uploadVideo($event)"
             (control)="playback($event)"
+            (laneControl)="lanePlayback($event.gateId, $event.action)"
             (sourceChange)="selectCamera($event)"
             (roleChange)="setCameraRole($event)"
           />

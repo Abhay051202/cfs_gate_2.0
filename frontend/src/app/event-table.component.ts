@@ -15,9 +15,26 @@ import { GateEvent } from './gate-api.service';
   </tr></thead>
   <tbody>@for (event of events(); track event.id) {<tr>
     <td>{{ event.timestamp | date:'dd MMM, HH:mm:ss' }}</td>
-    <td class="mono font-bold">{{ event.container_number || 'Unread / unconfirmed' }}</td>
+    <td class="mono font-bold">
+      @if (event.is_twin) {
+        <div class="twin-container-cell">
+          <span class="twin-badge-pill">TWIN 2x20'</span>
+          <div class="twin-numbers">
+            <div class="twin-row"><span class="slot-tag front">F</span> {{ event.container_number || 'Unread' }}</div>
+            <div class="twin-row"><span class="slot-tag rear">R</span> {{ event.container_number_2 || 'Unread' }}</div>
+          </div>
+        </div>
+      } @else {
+        {{ event.container_number || 'Unread / unconfirmed' }}
+      }
+    </td>
     <td>
-      @if (event.container_size) {
+      @if (event.is_twin) {
+        <div class="twin-sizes">
+          <span class="size-pill feet">📏 20 FT {{ event.size_code ? '(' + event.size_code + ')' : '' }}</span>
+          <span class="size-pill feet">📏 20 FT {{ event.size_code_2 ? '(' + event.size_code_2 + ')' : '' }}</span>
+        </div>
+      } @else if (event.container_size) {
         <span class="size-pill" [class.feet]="event.container_size.includes('FT')">
           📏 {{ event.container_size }}{{ event.size_code ? ' (' + event.size_code + ')' : '' }}
         </span>

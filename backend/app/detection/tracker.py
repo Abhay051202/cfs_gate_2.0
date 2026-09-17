@@ -26,7 +26,7 @@ class Track:
 
 
 class TemporalTracker:
-    def __init__(self, ttl_seconds=5, match_iou=0.25):
+    def __init__(self, ttl_seconds=5, match_iou=0.15):
         self.ttl_seconds, self.match_iou = ttl_seconds, match_iou
         self.tracks = {}
         self._next = 1

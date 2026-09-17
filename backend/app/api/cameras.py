@@ -10,17 +10,9 @@ def live_jpeg(runtime, camera_id):
     import cv2
     cam = runtime.manager.workers[camera_id]
     frame = cam.latest()
-    if frame is None:
+    if frame is None or frame.image is None:
         return None
-    img = frame.image.copy()
-    with runtime._state_lock:
-        result = runtime._preview_detections.get(camera_id)
-    if result and result[0] == frame.source_id and 0 <= (frame.timestamp - result[1]).total_seconds() <= .3:
-        for detection in result[2]:
-            x1, y1, x2, y2 = map(int, detection.bbox)
-            cv2.rectangle(img, (x1, y1), (x2, y2), (40, 190, 80), 2)
-            cv2.putText(img, f'{detection.class_name} {detection.confidence:.0%}',
-                        (max(5, x1), max(20, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, .55, (40, 190, 80), 2)
+    img = frame.image
     if img.shape[1] > 640:
         img = cv2.resize(img, (640, round(img.shape[0] * 640 / img.shape[1])))
     ok, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -148,29 +140,7 @@ def stream_camera(camera_id: str, request: Request):
             cam = worker(request, camera_id)
             frame = cam.latest()
             if frame is not None and frame.image is not None:
-                img = frame.image.copy()
-                try:
-                    dets = runtime.recent_detections(limit=10, camera_id=camera_id)
-                    now_ts = frame.timestamp
-                    for d in dets:
-                        d_ts_raw = d.get('frame_timestamp')
-                        if d_ts_raw:
-                            from datetime import datetime
-                            d_ts = datetime.fromisoformat(d_ts_raw.rstrip('Z'))
-                            if abs((now_ts - d_ts).total_seconds()) <= 0.8:
-                                bbox = d.get('bbox')
-                                cls_name = d.get('class_name', '')
-                                conf = d.get('confidence', 0.0)
-                                if bbox and len(bbox) == 4:
-                                    bx1, by1, bx2, by2 = map(int, bbox)
-                                    color = (0, 215, 255) if cls_name == 'feet' else (40, 190, 80)
-                                    cv2.rectangle(img, (bx1, by1), (bx2, by2), color, 2)
-                                    lbl = f"{cls_name.upper()} ({int(conf * 100)}%)"
-                                    cv2.putText(img, lbl, (max(5, bx1), max(20, by1 - 6)),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-                except Exception:
-                    pass
-
+                img = frame.image
                 if img.shape[1] > 640:
                     img = cv2.resize(img, (640, round(img.shape[0] * 640 / img.shape[1])))
                 ok, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -180,3 +150,71 @@ def stream_camera(camera_id: str, request: Request):
             time.sleep(0.04)  # ~25 FPS smooth playback
 
     return StreamingResponse(frame_generator(), media_type='multipart/x-mixed-replace; boundary=frame')
+
+
+class LensZoomAction(BaseModel):
+    action: Literal['in', 'out', 'stop', 'step_in', 'step_out'] = 'step_in'
+
+
+class LensFocusAction(BaseModel):
+    action: Literal['far', 'near', 'stop', 'step_far', 'step_near'] = 'step_far'
+
+
+@router.get('/{camera_id}/lens/status')
+def lens_status(camera_id: str, request: Request):
+    from app.camera.lens_control import get_lens_client_for_camera
+    client = get_lens_client_for_camera(request.app.state.runtime, camera_id)
+    if not client:
+        return {'supported': False, 'message': 'Not an RTSP/IP camera'}
+    return client.get_status()
+
+
+@router.post('/{camera_id}/lens/zoom')
+def lens_zoom(camera_id: str, body: LensZoomAction, request: Request):
+    from app.camera.lens_control import get_lens_client_for_camera
+    client = get_lens_client_for_camera(request.app.state.runtime, camera_id)
+    if not client:
+        raise HTTPException(400, 'Motorized lens control not supported for this camera')
+    return client.zoom(body.action)
+
+
+@router.post('/{camera_id}/lens/focus')
+def lens_focus(camera_id: str, body: LensFocusAction, request: Request):
+    from app.camera.lens_control import get_lens_client_for_camera
+    client = get_lens_client_for_camera(request.app.state.runtime, camera_id)
+    if not client:
+        raise HTTPException(400, 'Motorized lens control not supported for this camera')
+    return client.focus(body.action)
+
+
+@router.post('/{camera_id}/lens/autofocus')
+def lens_autofocus(camera_id: str, request: Request):
+    from app.camera.lens_control import get_lens_client_for_camera
+    client = get_lens_client_for_camera(request.app.state.runtime, camera_id)
+    if not client:
+        raise HTTPException(400, 'Motorized lens control not supported for this camera')
+    return client.autofocus()
+
+
+class ExposureSetting(BaseModel):
+    shutter: Literal['1/1000s', '1/500s', '1/250s', '1/100s', '1/50s', '1/25s', 'auto'] = '1/500s'
+    mode: Literal['auto', 'manual'] = 'auto'
+
+
+@router.get('/{camera_id}/exposure')
+def camera_exposure(camera_id: str, request: Request):
+    from app.camera.lens_control import get_lens_client_for_camera
+    client = get_lens_client_for_camera(request.app.state.runtime, camera_id)
+    if not client:
+        return {'supported': False, 'message': 'Not an IP camera with exposure API'}
+    return client.get_exposure()
+
+
+@router.post('/{camera_id}/exposure')
+def set_camera_exposure(camera_id: str, body: ExposureSetting, request: Request):
+    from app.camera.lens_control import get_lens_client_for_camera
+    client = get_lens_client_for_camera(request.app.state.runtime, camera_id)
+    if not client:
+        raise HTTPException(400, 'Exposure control not supported for this camera')
+    return client.set_shutter_speed(body.shutter, mode=body.mode)
+

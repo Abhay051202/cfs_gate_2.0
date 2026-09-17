@@ -13,9 +13,10 @@ EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v'}
 
 
 @router.post('/cameras/{camera_id}/video')
-async def upload_video(camera_id: str, request: Request):
+async def upload_video(camera_id: str, request: Request, sync_lane: bool = False):
     worker(request, camera_id)
     runtime = request.app.state.runtime
+    cam_cfg = next((c for c in runtime.cameras if c.id == camera_id), None)
     filename = unquote(request.headers.get('x-filename', 'video.mp4')).replace('\\', '/').split('/')[-1][:200]
     extension = Path(filename).suffix.lower()
     if extension not in EXTENSIONS:
@@ -45,12 +46,16 @@ async def upload_video(camera_id: str, request: Request):
             raise HTTPException(422, str(exc)) from None
         info = {'filename': filename, 'stored_name': stored_name, 'size_bytes': total, **metadata, 'active': True}
         try:
-            await asyncio.to_thread(runtime.activate_video, camera_id, info)
+            if sync_lane and cam_cfg:
+                await asyncio.to_thread(runtime.activate_lane_video, cam_cfg.gate_id, info)
+            else:
+                await asyncio.to_thread(runtime.activate_video, camera_id, info)
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from None
         installed = True
         return {'camera_id': camera_id, 'video': {k: v for k, v in info.items() if k != 'stored_name'},
-                'message': 'Video ready. Press Play to start this camera slot.'}
+                'sync_lane': sync_lane,
+                'message': 'Video ready. Press Play to start.'}
     finally:
         if not installed:
             path.unlink(missing_ok=True)
@@ -70,6 +75,19 @@ def playback(camera_id: str, body: Playback, request: Request):
     except RuntimeError as exc:
         raise HTTPException(409, str(exc)) from None
     return {'camera_id': camera_id, 'status': worker(request, camera_id).status()}
+
+
+@router.post('/lanes/{gate_id}/playback')
+def lane_playback(gate_id: str, body: Playback, request: Request):
+    runtime = request.app.state.runtime
+    try:
+        runtime.control_lane_video(gate_id, body.action)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from None
+    statuses = [w.status() for w in runtime.manager.workers.values() if w.config.gate_id == gate_id]
+    return {'gate_id': gate_id, 'action': body.action, 'statuses': statuses}
 
 
 @router.post('/videos/play-all')
