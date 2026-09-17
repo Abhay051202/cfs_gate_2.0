@@ -126,10 +126,14 @@ class GateRuntime:
 
     def start_processing(self):
         with self._model_lock:
-            if self.model_status['detector'] in ('READY', 'LOADING') and self.model_status['ocr'] in ('READY', 'LOADING'):
+            if self.model_status['detector'] == 'READY' and self.model_status['ocr'] == 'READY':
                 return
             self.settings.pipeline_enabled = True
-            self.model_status = {'detector': 'LOADING', 'ocr': 'LOADING', 'error_type': None}
+            if self.model_status['detector'] != 'READY':
+                self.model_status['detector'] = 'LOADING'
+            if self.model_status['ocr'] != 'READY':
+                self.model_status['ocr'] = 'LOADING'
+            self.model_status['error_type'] = None
             thread = threading.Thread(target=self._initialize_pipeline, name='gate-model-loader', daemon=True)
             self._threads.append(thread)
             thread.start()
@@ -398,24 +402,38 @@ class GateRuntime:
             self.process_frame(camera, frame)
 
     def _initialize_pipeline(self):
-        try:
-            self.detector = self.detector_factory(self.settings)
-            self.model_status['detector'] = 'READY'
-            self.ocr = self.ocr_factory(self.settings)
-            self.model_status['ocr'] = 'READY'
-            if self._stop.is_set():
-                return
-            log.info('models_loaded')
-            for name, target in [('gate-inference', self._inference_loop), ('gate-ocr', self._ocr_loop)]:
-                thread = threading.Thread(target=target, name=name, daemon=True)
-                self._threads.append(thread)
-                thread.start()
-        except Exception as exc:
-            if self.detector is None:
+        # 1. Independent Detector initialization
+        if self.model_status['detector'] != 'READY':
+            try:
+                self.detector = self.detector_factory(self.settings)
+                self.model_status['detector'] = 'READY'
+                log.info('detector_loaded')
+            except Exception as exc:
                 self.model_status['detector'] = 'ERROR'
-            self.model_status['ocr'] = 'ERROR'
-            self.model_status['error_type'] = type(exc).__name__
-            log.error('model_load_failed', extra={'error_type': type(exc).__name__})
+                self.model_status['error_type'] = type(exc).__name__
+                log.error('detector_load_failed', extra={'error_type': type(exc).__name__})
+
+        if self.model_status['detector'] == 'READY' and not any(t.name == 'gate-inference' and t.is_alive() for t in self._threads):
+            thread = threading.Thread(target=self._inference_loop, name='gate-inference', daemon=True)
+            self._threads.append(thread)
+            thread.start()
+
+        # 2. Independent OCR initialization
+        if self.model_status['ocr'] != 'READY':
+            try:
+                self.ocr = self.ocr_factory(self.settings)
+                self.model_status['ocr'] = 'READY'
+                log.info('ocr_loaded')
+            except Exception as exc:
+                self.model_status['ocr'] = 'ERROR'
+                if not self.model_status.get('error_type'):
+                    self.model_status['error_type'] = type(exc).__name__
+                log.error('ocr_load_failed', extra={'error_type': type(exc).__name__})
+
+        if self.model_status['ocr'] == 'READY' and not any(t.name == 'gate-ocr' and t.is_alive() for t in self._threads):
+            thread = threading.Thread(target=self._ocr_loop, name='gate-ocr', daemon=True)
+            self._threads.append(thread)
+            thread.start()
 
     def stop(self):
         self._stop.set()
@@ -502,9 +520,10 @@ class GateRuntime:
                 wall_since_last = time.monotonic() - state['last_ocr']
                 if state['pending'] or state['done']:
                     continue
-                if state.get('last_ocr_ts') and ts_since_last < self.settings.ocr_interval_seconds:
+                min_interval = 0.4 if (getattr(camera, 'source_type', 'live') == 'file' or getattr(frame, 'source_id', '') in ('test', 'file')) else self.settings.ocr_interval_seconds
+                if state.get('last_ocr_ts') and ts_since_last < min_interval:
                     continue
-                if getattr(camera, 'source_type', 'live') != 'file' and getattr(frame, 'source_id', '') not in ('test', 'file') and wall_since_last < self.settings.ocr_interval_seconds:
+                if getattr(camera, 'source_type', 'live') != 'file' and getattr(frame, 'source_id', '') not in ('test', 'file') and wall_since_last < min_interval:
                     continue
                 if state.get('samples', 0) >= self.settings.ocr_max_attempts:
                     if state.get('done') or state.get('samples', 0) >= self.settings.ocr_max_attempts * 2:
@@ -757,6 +776,9 @@ class GateRuntime:
 
     def _ocr_loop(self):
         while not self._stop.is_set():
+            if self.ocr is None or self.model_status.get('ocr') != 'READY':
+                self._stop.wait(0.5)
+                continue
             job_id = None
             try:
                 job_id = self.ocr_store.next_id()

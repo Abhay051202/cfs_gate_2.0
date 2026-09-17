@@ -5,6 +5,8 @@ from app.domain import Detection, Frame
 class YoloDetector:
     def __init__(self, settings, model=None):
         self.settings = settings
+        from app.device import resolve_optimal_device
+        self.device, self.has_cuda = resolve_optimal_device(settings.model_device)
         if model is None:
             expected = {'pytorch': '.pt', 'onnx': '.onnx', 'tensorrt': '.engine'}[settings.model_backend]
             if settings.model_path.suffix != expected or not settings.model_path.is_file():
@@ -14,9 +16,18 @@ class YoloDetector:
         self.model = model
 
     def detect(self, frame: Frame) -> list[Detection]:
-        results = self.model.predict(source=frame.image, conf=self.settings.confidence_threshold,
-                                     imgsz=self.settings.model_image_size, device=self.settings.model_device,
-                                     verbose=False, rect=False)
+        try:
+            results = self.model.predict(source=frame.image, conf=self.settings.confidence_threshold,
+                                         imgsz=self.settings.model_image_size, device=self.device,
+                                         verbose=False, rect=False)
+        except Exception:
+            if self.device != 'cpu':
+                self.device = 'cpu'
+                results = self.model.predict(source=frame.image, conf=self.settings.confidence_threshold,
+                                             imgsz=self.settings.model_image_size, device='cpu',
+                                             verbose=False, rect=False)
+            else:
+                raise
         height, width = frame.image.shape[:2]
         detections = []
         for result in results:

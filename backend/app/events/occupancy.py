@@ -111,7 +111,7 @@ class ViewOccupancy:
 
         # 1. Filter raw candidates: must intersect occupancy ROI, not past exit, and realistic container size
         raw_candidates = [(d, b) for d, b in all_boxes
-                          if iou(b, zone) > 0 and not self._past_exit(b, camera) and box_area(b) >= 0.08]
+                          if iou(b, zone) > 0 and not self._past_exit(b, camera) and box_area(b) >= 0.08 and box_area(b) < 0.85 and (b[2] - b[0] < 0.95 or b[3] - b[1] < 0.95)]
 
         # 2. Suppress nested sub-boxes (e.g. text strips, decals, doors detected inside container body)
         candidates = []
@@ -135,19 +135,14 @@ class ViewOccupancy:
 
             # Check if all tracked container slots departed past the exit boundary
             if state.slots and all(self._past_exit(s.bbox, camera) for s in state.slots.values()):
-                self.current = None
-                return None
-
-            # Backward-compat: single box departed past exit
-            matched_dep = max(all_boxes, key=lambda item: iou(state.bbox, item[1]), default=None)
-            if matched_dep and iou(state.bbox, matched_dep[1]) > 0.15:
-                if not self._past_exit(state.bbox, camera) and self._past_exit(matched_dep[1], camera):
+                if state.is_twin or (now - state.last_measured).total_seconds() >= 3.0:
                     self.current = None
                     return None
 
             if not candidates:
                 state.clear_since = state.clear_since or now
-                if (now - state.clear_since).total_seconds() >= self.settings.gate_clear_seconds:
+                clear_timeout = max(4.0, self.settings.gate_clear_seconds)
+                if (now - state.clear_since).total_seconds() >= clear_timeout:
                     self.current = None
                 return None
 
@@ -164,7 +159,7 @@ class ViewOccupancy:
                     state.is_twin = True
                     state.closed = False
                     state.slots['REAR'] = ContainerSlot('REAR', f'{state.origin}:rear', rear_b, center(rear_b), now, now, now, event_id=state.event_id)
-                if 'FRONT' in state.slots:
+                if 'FRONT' in state.slots and not state.slots['FRONT'].closed:
                     self._update_slot(state.slots['FRONT'], front_b, now)
                 if 'REAR' in state.slots:
                     self._update_slot(state.slots['REAR'], rear_b, now)
@@ -174,23 +169,30 @@ class ViewOccupancy:
                 rear_slot = state.slots.get('REAR')
 
                 if state.is_twin and rear_slot:
-                    front_coord = center(front_slot.bbox)[axis] if front_slot else 0
-                    rear_coord = center(rear_slot.bbox)[axis] if rear_slot else 0
-                    b_coord = center(b)[axis]
-                    front_match = iou(front_slot.bbox, b) if front_slot else 0.0
-                    rear_match = iou(rear_slot.bbox, b) if rear_slot else 0.0
-
-                    if rear_match > front_match and rear_match >= 0.10:
+                    if front_slot and front_slot.closed:
                         self._update_slot(rear_slot, b, now)
-                    elif front_match >= 0.10:
-                        self._update_slot(front_slot, b, now)
                     else:
-                        front_dist = abs(front_coord - b_coord)
-                        rear_dist = abs(rear_coord - b_coord)
-                        if rear_dist < front_dist:
+                        front_coord = center(front_slot.bbox)[axis] if front_slot else 0
+                        rear_coord = center(rear_slot.bbox)[axis] if rear_slot else 0
+                        b_coord = center(b)[axis]
+                        front_match = iou(front_slot.bbox, b) if front_slot else 0.0
+                        rear_match = iou(rear_slot.bbox, b) if rear_slot else 0.0
+
+                        is_behind = (b_coord > front_coord + 0.15) if not is_pos else (b_coord < front_coord - 0.15)
+
+                        if is_behind or (rear_match > front_match and rear_match >= 0.10):
                             self._update_slot(rear_slot, b, now)
-                        else:
+                            if front_slot and abs(b_coord - front_coord) > 0.35:
+                                front_slot.closed = True
+                        elif front_match >= 0.10:
                             self._update_slot(front_slot, b, now)
+                        else:
+                            front_dist = abs(front_coord - b_coord)
+                            rear_dist = abs(rear_coord - b_coord)
+                            if rear_dist < front_dist:
+                                self._update_slot(rear_slot, b, now)
+                            else:
+                                self._update_slot(front_slot, b, now)
                 elif front_slot:
                     front_coord = center(front_slot.bbox)[axis]
                     b_coord = center(b)[axis]
@@ -198,19 +200,23 @@ class ViewOccupancy:
                     front_dim = front_slot.bbox[other_axis + 2] - front_slot.bbox[other_axis]
                     other_diff = abs(center(b)[other_axis] - center(front_slot.bbox)[other_axis])
                     same_lane = other_diff < 0.35 if front_dim <= 1.0 else other_diff < (0.35 * front_dim)
-                    is_behind = (b_coord < front_coord) if is_pos else (b_coord > front_coord)
+                    is_behind = (b_coord > front_coord + 0.15) if not is_pos else (b_coord < front_coord - 0.15)
                     front_match = iou(front_slot.bbox, b)
 
-                    if same_lane and is_behind and (front_match < 0.35 or front_slot.closed):
+                    if same_lane and (is_behind or front_slot.closed or front_match < 0.20):
                         state.is_twin = True
                         state.closed = False
                         state.slots['REAR'] = ContainerSlot('REAR', f'{state.origin}:rear', b, center(b), now, now, now, event_id=state.event_id)
+                        state.active_slot = 'REAR'
                     elif front_match >= 0.10:
                         self._update_slot(front_slot, b, now)
 
             # Synchronize master state properties
             state.stationary = any(s.stationary for s in state.slots.values()) if state.slots else False
-            state.closed = all(s.closed for s in state.slots.values()) if state.slots else False
+            if state.is_twin:
+                state.closed = all(s.closed for s in state.slots.values()) if state.slots else False
+            else:
+                state.closed = False
             if 'FRONT' in state.slots:
                 state.bbox = state.slots['FRONT'].bbox
                 state.anchor = state.slots['FRONT'].anchor
@@ -222,25 +228,22 @@ class ViewOccupancy:
             front_slot = state.slots.get('FRONT')
             rear_slot = state.slots.get('REAR')
 
-            front_cand = max(((d, b) for d, b in candidates if front_slot and iou(front_slot.bbox, b) >= 0.10),
+            front_cand = max(((d, b) for d, b in candidates if front_slot and not front_slot.closed and iou(front_slot.bbox, b) >= 0.10),
                              key=lambda item: iou(front_slot.bbox, item[1]), default=None)
-            rear_cand = max(((d, b) for d, b in candidates if rear_slot and iou(rear_slot.bbox, b) >= 0.10),
+            rear_cand = max(((d, b) for d, b in candidates if rear_slot and not rear_slot.closed and iou(rear_slot.bbox, b) >= 0.10),
                             key=lambda item: iou(rear_slot.bbox, item[1]), default=None)
 
+            if rear_slot and not rear_slot.closed and not rear_cand and candidates:
+                rear_cand = max(candidates, key=lambda item: center(item[1])[axis] if not is_pos else -center(item[1])[axis])
+
             target = None
-            if rear_slot and not rear_slot.closed and rear_cand:
-                if not front_slot or front_slot.closed:
-                    target = ('REAR', rear_cand[0])
-                elif front_cand and front_cand[0] is not rear_cand[0]:
+            if front_slot and not front_slot.closed and front_cand:
+                if rear_slot and not rear_slot.closed and rear_cand and front_cand[0] is not rear_cand[0]:
                     target = ('FRONT', front_cand[0]) if getattr(frame, 'sequence', 0) % 2 == 0 else ('REAR', rear_cand[0])
                 else:
-                    target = ('REAR', rear_cand[0])
-            elif front_slot and not front_slot.closed and front_cand:
-                target = ('FRONT', front_cand[0])
-            elif rear_cand and rear_slot and not rear_slot.closed:
+                    target = ('FRONT', front_cand[0])
+            elif rear_slot and not rear_slot.closed and rear_cand:
                 target = ('REAR', rear_cand[0])
-            elif front_cand and front_slot and not front_slot.closed:
-                target = ('FRONT', front_cand[0])
 
             if target:
                 state.active_slot = target[0]
@@ -305,7 +308,10 @@ class ViewOccupancy:
         state.event_id = event_id
         if not state.container_number:
             state.container_number = container_number
-        state.closed = all(s.closed for s in state.slots.values()) if state.slots else True
+        if state.is_twin:
+            state.closed = all(s.closed for s in state.slots.values()) if state.slots else True
+        else:
+            state.closed = False
 
     def status(self):
         state = self.current

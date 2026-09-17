@@ -36,10 +36,28 @@ class GateRepository:
         created_paths = []
         try:
             with self._write_lock, self.db.sessions.begin() as session:
+                number = obs.ocr.normalized_text if obs.confirmed else None
+                is_rear_slot = getattr(obs, 'slot_position', 'FRONT') == 'REAR' or obs.origin_key.endswith(':rear')
                 prior = session.scalar(select(DetectionRecord).where(DetectionRecord.origin_key == obs.origin_key))
                 if prior:
+                    existing = session.get(GateEvent, prior.event_id)
+                    if existing and number:
+                        if is_rear_slot:
+                            existing.is_twin = True
+                            if not existing.container_number_2 or obs.confirmed:
+                                existing.container_number_2 = number
+                                existing.iso_code_2 = getattr(obs.ocr, 'size_type', None) or '22G1'
+                        else:
+                            if not existing.container_number or obs.confirmed:
+                                existing.container_number = number
+                                existing.iso_code_1 = getattr(obs.ocr, 'size_type', None) or existing.iso_code_1
+                        if obs.confirmed:
+                            if existing.is_twin:
+                                if existing.container_number and existing.container_number_2:
+                                    existing.status = 'CONFIRMED'
+                            else:
+                                existing.status = 'CONFIRMED'
                     return prior.event_id, False
-                number = obs.ocr.normalized_text if obs.confirmed else None
                 delta = timedelta(seconds=dedup_seconds)
                 existing = None
 
@@ -56,7 +74,8 @@ class GateRepository:
                         GateEvent.gate_id == obs.gate_id,
                         (GateEvent.container_number == number) |
                         (GateEvent.container_number_2 == number) |
-                        (GateEvent.container_number.is_(None)),
+                        (GateEvent.container_number.is_(None)) |
+                        ((GateEvent.container_number.isnot(None)) & (GateEvent.container_number_2.is_(None)) if is_rear_slot else False),
                         direction_match,
                         GateEvent.timestamp >= obs.detection.frame_timestamp - delta,
                         GateEvent.timestamp <= obs.detection.frame_timestamp + delta,
@@ -130,9 +149,15 @@ class GateRepository:
                             existing.container_number_2 = number
                             existing.iso_code_2 = getattr(obs.ocr, 'size_type', None) or '22G1'
                     else:
-                        if (number != existing.container_number_2 or not existing.container_number_2) and (not existing.container_number or obs.confirmed):
-                            existing.container_number = number
-                            existing.iso_code_1 = getattr(obs.ocr, 'size_type', None)
+                        if existing.container_number and number != existing.container_number and obs.confirmed:
+                            # A second distinct confirmed container arrived on this vehicle
+                            existing.is_twin = True
+                            existing.container_number_2 = number
+                            existing.iso_code_2 = getattr(obs.ocr, 'size_type', None) or '22G1'
+                        else:
+                            if (number != existing.container_number_2 or not existing.container_number_2) and (not existing.container_number or obs.confirmed):
+                                existing.container_number = number
+                                existing.iso_code_1 = getattr(obs.ocr, 'size_type', None)
                         if obs.origin_key.endswith(':front'):
                             existing.is_twin = True
                     if existing.is_twin:

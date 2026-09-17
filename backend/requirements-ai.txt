@@ -1,6 +1,8 @@
 -r requirements.txt
 ultralytics>=8.3,<9
 easyocr>=1.7,<2
-# Install the appropriate PyTorch build FIRST, especially on Jetson.
-# ONNX: install onnxruntime (CPU) or a compatible onnxruntime-gpu build.
-# TensorRT: install through the target JetPack; export engines on that target.
+transformers>=4.45,<5
+accelerate>=0.26
+qwen-vl-utils>=0.0.8
+torchvision
+Pillow>=10.0

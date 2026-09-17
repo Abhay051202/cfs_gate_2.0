@@ -116,6 +116,10 @@ class ContainerValidator:
     def validate(self, read: OCRRead) -> Validation:
         raw = correct_feet_size_codes(read.raw_text[:4096])
         candidates = {normalize(m.group(1)) for m in CANDIDATE.finditer(raw.upper())}
+        if not candidates:
+            concat_match = re.search(r'(?<![A-Z0-9])([A-Z]{3}[UJZ][0-9]{7})(?:[1-4LMN][0-9][GVRHBUTP][0-9A-Z])', raw.upper())
+            if concat_match:
+                candidates = {normalize(concat_match.group(1))}
         if len(candidates) > 1:
             return Validation(raw, '', read.confidence, False, False, 'AMBIGUOUS')
         if candidates:

@@ -40,7 +40,8 @@ class EventManager:
         votes = Counter(r.normalized_text for r in good)
         best, count = votes.most_common(1)[0] if votes else (None, 0)
         tied = sum(v == count for v in votes.values()) > 1
-        confirmed = count >= self.settings.ocr_confirmations and not tied
+        has_verified_checksum = bool(good and any(r.valid_check_digit and r.confidence >= 0.80 for r in good if r.normalized_text == best))
+        confirmed = (count >= self.settings.ocr_confirmations and not tied) or has_verified_checksum
         if not confirmed and len(evidence.reads) < self.settings.ocr_max_attempts:
             return None
         if not confirmed and not any(getattr(r, 'raw_text', None) for r in evidence.reads if r):

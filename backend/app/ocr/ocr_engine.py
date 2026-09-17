@@ -44,7 +44,9 @@ def _extract_text_from_items(items):
 class EasyOCREngine:
     def __init__(self, settings):
         import easyocr
-        self.reader = easyocr.Reader(['en'], gpu=settings.ocr_gpu,
+        from app.device import resolve_optimal_device
+        _, is_cuda = resolve_optimal_device(settings.ocr_gpu)
+        self.reader = easyocr.Reader(['en'], gpu=is_cuda,
                                      model_storage_directory=str(settings.ocr_model_directory),
                                      download_enabled=settings.ocr_download_enabled, verbose=False)
 
@@ -136,16 +138,31 @@ class OlmOCREngine:
         from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
         self.model_name = getattr(settings, 'ocr_model_name', 'Qwen/Qwen2-VL-2B-Instruct')
-        self.device = 'cuda' if (getattr(settings, 'ocr_gpu', True) and torch.cuda.is_available()) else 'cpu'
-        self.torch_dtype = torch.float16 if self.device == 'cuda' else torch.float32
+        from app.device import resolve_optimal_device
+        self.device, is_cuda = resolve_optimal_device(getattr(settings, 'ocr_gpu', 'auto'))
+        self.torch_dtype = torch.float16 if is_cuda else torch.float32
 
         log.info(f'Loading oLmOCR (Qwen2-VL) model {self.model_name} on {self.device}...')
         self.processor = AutoProcessor.from_pretrained(self.model_name)
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            self.model_name,
-            torch_dtype=self.torch_dtype,
-            device_map=self.device
-        )
+        try:
+            device_map = 'auto' if is_cuda else None
+            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                self.model_name,
+                torch_dtype=self.torch_dtype,
+                device_map=device_map
+            )
+        except Exception as exc:
+            if is_cuda:
+                log.warning(f'Failed loading Qwen2-VL on {self.device} ({exc}). Auto-falling back to CPU safely...')
+                self.device = 'cpu'
+                self.torch_dtype = torch.float32
+                self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    self.model_name,
+                    torch_dtype=self.torch_dtype,
+                    device_map=None
+                )
+            else:
+                raise
         self.prompt = (
             "You are an industrial container OCR system. Read all container markings on this image: the container owner code, serial number, check digit, and ISO size-type code or feet markings (e.g. TIIU 507766 9 45G1 or MSCU 654602 1 22G1). "
             "Output the letters and digits separated by spaces. Do not output explanations."
@@ -163,6 +180,12 @@ class OlmOCREngine:
             return OCRRead('', 0.0)
 
         try:
+            h, w = image.shape[:2]
+            max_dim = 1280
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                image = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
             rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(rgb_image)
 
@@ -178,13 +201,14 @@ class OlmOCREngine:
 
             text_template = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             image_inputs, video_inputs = process_vision_info(messages)
+            target_device = getattr(self.model, 'device', self.device)
             inputs = self.processor(
                 text=[text_template],
                 images=image_inputs,
                 videos=video_inputs,
                 padding=True,
                 return_tensors='pt'
-            ).to(self.device)
+            ).to(target_device)
 
             with torch.no_grad():
                 generated_ids = self.model.generate(

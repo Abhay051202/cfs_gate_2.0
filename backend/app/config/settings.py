@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     pipeline_enabled: bool = True
     model_backend: Literal['pytorch', 'onnx', 'tensorrt'] = 'pytorch'
     model_path: Path = Path('models/best.pt')
-    model_device: str = 'cpu'
+    model_device: str = 'auto'
     model_image_size: int = Field(default=640, ge=32)
     class_aliases: dict[str, str] = {'cointainer': 'container', 'container_object': 'container', 'feet': 'feet'}
     target_classes: list[str] = ['container', 'trailer', 'truck', 'vehicle', 'feet', 'cointainer', 'container_object']
@@ -69,7 +69,7 @@ class Settings(BaseSettings):
 
     ocr_engine: Literal['olmocr', 'easyocr', 'qwen2_vl', 'qwen2vl'] = 'olmocr'
     ocr_model_name: str = 'Qwen/Qwen2-VL-2B-Instruct'
-    ocr_gpu: bool = True
+    ocr_gpu: bool | str = 'auto'
     ocr_download_enabled: bool = False
     ocr_model_directory: Path = Path('models/easyocr')
     inference_fps: float = Field(default=3, gt=0, le=60)
