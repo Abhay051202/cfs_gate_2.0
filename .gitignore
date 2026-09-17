@@ -76,9 +76,9 @@ uploads/*.mov
 uploads/*.mkv
 uploads/*.webm
 uploads/*.m4v
-snapshots/
+/snapshots/
 backend/snapshots/
-**/snapshots/**
+!backend/app/snapshots/
 backend/uploads/*.mp4
 backend/uploads/*.avi
 backend/uploads/*.mov
