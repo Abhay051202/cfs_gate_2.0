@@ -1,3 +1,4 @@
+from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -57,4 +58,5 @@ class Observation:
     all_detections: list[Detection] | None = None
     slot_position: str = 'FRONT'
     event_id: str | None = None
+    is_twin: bool = False
 

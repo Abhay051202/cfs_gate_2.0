@@ -75,6 +75,7 @@ uploads/*.avi
 uploads/*.mov
 uploads/*.mkv
 uploads/*.webm
+/snapshots
 /snapshots/*
 !/snapshots/.gitkeep
 backend/snapshots/*
@@ -88,6 +89,8 @@ backend/uploads/*.webm
 backend/uploads/ocr-spool/
 **/ocr-spool/**
 uploads/ocr-spool/
+backend/uploads/*.json
+uploads/*.json
 
 # --- Scratch, Test Crops & Temporary Images ---
 scratch/
@@ -95,9 +98,6 @@ scratch_*.py
 backend/scratch_*.py
 backend/test_spool_status.py
 test_spool_status.py
-backend/tests/test_targeted_ocr.py
-backend/tests/test_dwell.py
-backend/tests/test_twin_occupancy.py
 feet_*.png
 feet_*.jpg
 feet_crop_*.jpg
@@ -107,6 +107,8 @@ crop_test.jpg
 thresh.jpg
 word_*.jpg
 *.tmp
+*evaluation*.json
+
 
 # --- Frontend Node & Build Artifacts ---
 node_modules/
@@ -123,6 +125,8 @@ frontend/node_modules/
 *.sqlite
 *.sqlite3
 *.log
+logs/
+backend/logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -137,12 +141,8 @@ yarn-error.log*
 Thumbs.db
 
 # --- Documentation Notes & Agent Logs ---
-brain.md
 chat.md
-CHANGELOG.md
-docs/brain.md
 docs/chat.md
-docs/CHANGELOG.md
 *.chat
 *.prompt
 

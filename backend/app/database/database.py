@@ -1,3 +1,4 @@
+from __future__ import annotations
 from sqlalchemy import create_engine, event, inspect, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -43,6 +44,12 @@ class Database:
             insp = inspect(conn)
             if 'gate_events' in insp.get_table_names():
                 cols = {c['name'] for c in insp.get_columns('gate_events')}
+                if 'visit_id' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN visit_id VARCHAR(36)')
+                if 'capture_policy' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN capture_policy VARCHAR(20)')
+                if 'lane_id' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN lane_id VARCHAR(32)')
                 if 'is_twin' not in cols:
                     conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN is_twin BOOLEAN DEFAULT 0')
                 if 'container_number_2' not in cols:
@@ -51,6 +58,31 @@ class Database:
                     conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN iso_code_1 VARCHAR(4)')
                 if 'iso_code_2' not in cols:
                     conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN iso_code_2 VARCHAR(4)')
+                if 'cloud_synced' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN cloud_synced BOOLEAN DEFAULT 0')
+                if 'cloud_synced_at' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN cloud_synced_at DATETIME')
+                if 'cloud_event_id' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN cloud_event_id VARCHAR(64)')
+                if 'proof_version' not in cols:
+                    conn.exec_driver_sql('ALTER TABLE gate_events ADD COLUMN proof_version INTEGER DEFAULT 1')
+            if 'acknowledged_proofs' not in insp.get_table_names():
+                conn.exec_driver_sql('''
+                    CREATE TABLE IF NOT EXISTS acknowledged_proofs (
+                        id VARCHAR(36) PRIMARY KEY,
+                        event_id VARCHAR(36) NOT NULL,
+                        cloud_event_id VARCHAR(64) NOT NULL,
+                        container_number VARCHAR(11) NOT NULL,
+                        camera_id VARCHAR(64) NOT NULL,
+                        image_path VARCHAR(256) NOT NULL,
+                        image_hash VARCHAR(64) NOT NULL,
+                        capture_timestamp DATETIME NOT NULL,
+                        proof_version INTEGER NOT NULL DEFAULT 1,
+                        acknowledged_at DATETIME NOT NULL,
+                        FOREIGN KEY (event_id) REFERENCES gate_events(id) ON DELETE CASCADE
+                    )
+                ''')
+                conn.exec_driver_sql('CREATE INDEX IF NOT EXISTS ix_ack_event_cntr_cam ON acknowledged_proofs (event_id, container_number, camera_id)')
 
     def initialize(self):
         existing = set(inspect(self.engine).get_table_names())

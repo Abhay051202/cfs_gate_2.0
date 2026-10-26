@@ -1,3 +1,4 @@
+from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 import os
@@ -8,6 +9,22 @@ from pydantic import BaseModel, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Direction = Literal['ENTRY', 'EXIT', 'UNKNOWN']
+
+
+class LaneRegion(BaseModel):
+    id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,32}$')
+    polygon: list[tuple[float, float]] = Field(min_length=3, max_length=12)
+
+    @model_validator(mode='after')
+    def validate_polygon(self):
+        if any(not (0 <= x <= 1 and 0 <= y <= 1) for x, y in self.polygon):
+            raise ValueError('Lane vertices must be inside the frame')
+        import cv2
+        import numpy as np
+        points = np.array(self.polygon, dtype=np.float32)
+        if not cv2.isContourConvex(points) or cv2.contourArea(points) < .001:
+            raise ValueError('Draw a convex lane polygon with nonzero area')
+        return self
 
 
 class CameraConfig(BaseModel):
@@ -31,6 +48,7 @@ class CameraConfig(BaseModel):
     line_deadband: float = Field(default=0.03, ge=0, lt=0.5)
     positive_crossing: Literal['ENTRY', 'EXIT'] = 'ENTRY'
     occupancy_roi: tuple[float, float, float, float] = (0, 0, 1, 1)
+    lanes: list[LaneRegion] = Field(default_factory=list, max_length=2)
     gate_exit_axis: Literal['x', 'y'] | None = None
     gate_exit_position: float = Field(default=.95, gt=0, lt=1)
     gate_exit_positive: bool = True
@@ -59,52 +77,101 @@ class Settings(BaseSettings):
     database_url: SecretStr = SecretStr('sqlite+pysqlite:///data/gate.db')
     cameras_file: Path = Path('config/cameras.yaml')
     pipeline_enabled: bool = True
+    vehicle_visit_tracking: bool = True
+    minimum_number_proof_cameras: int = Field(default=1, ge=1, le=16)
+    shared_visit_folders: bool = True
+    container_roi_trigger: bool = True
+    reversal_grace_seconds: float = Field(default=30, ge=0, le=300)
+    cross_camera_arrival_window_seconds: float = Field(default=30, ge=1, le=120)
     model_backend: Literal['pytorch', 'onnx', 'tensorrt'] = 'pytorch'
     model_path: Path = Path('models/best.pt')
-    model_device: str = 'auto'
+    vehicle_presence_min_confidence: float = Field(default=0.5, ge=0.5, le=1)
+    passage_vehicle_model_path: Path = Path('models/yolov8x.pt')
+    model_device: str = 'cpu'
     model_image_size: int = Field(default=640, ge=32)
-    class_aliases: dict[str, str] = {'cointainer': 'container', 'container_object': 'container', 'feet': 'feet'}
-    target_classes: list[str] = ['container', 'trailer', 'truck', 'vehicle', 'feet', 'cointainer', 'container_object']
-    ocr_classes: list[str] = ['container', 'trailer', 'cointainer', 'container_object', 'feet']
+    class_aliases: dict[str, str] = {}
+    target_classes: list[str] = ['container', 'container_number', 'iso_code']
+    ocr_classes: list[str] = ['container', 'container_number', 'iso_code']
 
-    ocr_engine: Literal['olmocr', 'easyocr', 'qwen2_vl', 'qwen2vl'] = 'olmocr'
+    # PaddleOCR runs in its own CUDA worker so it does not contend with the
+    # PyTorch YOLO process. Qwen remains a last-resort reader only.
+    ocr_engine: Literal['paddleocr', 'olmocr', 'easyocr', 'qwen2_vl', 'qwen2vl'] = 'paddleocr'
+    ocr_fallback_engine: Literal['olmocr', 'easyocr', 'none'] = 'none'
+    paddle_ocr_detection_model: str = 'PP-OCRv6_medium_det'
+    paddle_ocr_recognition_model: str = 'PP-OCRv6_medium_rec'
     ocr_model_name: str = 'Qwen/Qwen2-VL-2B-Instruct'
-    ocr_gpu: bool | str = 'auto'
+    ocr_gpu: bool = True
     ocr_download_enabled: bool = False
     ocr_model_directory: Path = Path('models/easyocr')
     inference_fps: float = Field(default=3, gt=0, le=60)
     confidence_threshold: float = Field(default=0.35, ge=0, le=1)
     ocr_min_confidence: float = Field(default=0.6, ge=0, le=1)
     min_track_hits: int = Field(default=3, ge=1)
+    # One valid check-digit read is sufficient once a truck is stationary;
+    # additional samples remain available for twin confirmation and review.
     ocr_confirmations: int = Field(default=2, ge=1)
     ocr_max_attempts: int = Field(default=4, ge=1)
-    ocr_interval_seconds: float = Field(default=1, gt=0)
+    ocr_interval_seconds: float = Field(default=.5, gt=0)
     ocr_queue_size: int = Field(default=8, ge=1, le=100)
-    ocr_spool_max_mb: int = Field(default=10240, ge=1)
-    gate_clear_seconds: float = Field(default=7, ge=1, le=60)
+    # The spool is a temporary OCR work area. Definitive event evidence is
+    # stored under snapshots, so this must stay bounded on an edge device.
+    ocr_spool_max_mb: int = Field(default=2048, ge=256)
+    gate_clear_seconds: float = Field(default=7, ge=1, le=120)
+    # Keep a confirmed event local briefly so OCR from a second calibrated
+    # camera can join the same visit before the immutable cloud POST happens.
+    # This is especially important for twin containers where the rear view
+    # often arrives after the front view.
+    # Give the other calibrated gate cameras time to contribute a rear/twin
+    # identity before the cloud transaction becomes immutable.  Operators can
+    # tune this per site through CLOUD_DISPATCH_GRACE_SECONDS.
+    cloud_dispatch_grace_seconds: float = Field(default=10, ge=0, le=60)
+    # Minimum sharpness/exposure score for a frame sent as cloud proof.
+    # Frames below this are retained locally for diagnostics but never sent.
+    cloud_min_proof_quality: float = Field(default=2.5, ge=0, le=1000)
+    # Maximum timestamp distance used when joining two calibrated RTSP views
+    # into one candidate truck visit. Keep this bounded for queued traffic.
+    # Cameras on one gate are timestamp-joined only briefly.  A long window
+    # causes the next queued truck to be treated as another view of this one.
+    cross_camera_view_window_seconds: float = Field(default=8, ge=1, le=60)
+    # Uploaded videos usually have independent clocks and may show different
+    # trucks. Do not fuse their cameras unless an operator explicitly enables
+    # synchronized-file mode.
+    allow_file_cross_camera_fusion: bool = False
     stationary_drift_threshold: float = Field(default=.02, gt=0, lt=.05)
     stationary_match_iou: float = Field(default=.45, ge=.45, lt=1)
-    stationary_seconds: float = Field(default=1, gt=0)
+    stationary_seconds: float = Field(default=.8, gt=0)
     gate_observation_gap_seconds: float = Field(default=2, gt=0)
-    dwell_container_classes: list[str] = ['container', 'trailer', 'cointainer', 'container_object', 'feet']
+    dwell_container_classes: list[str] = ['container', 'container_number', 'iso_code']
     dedup_seconds: float = Field(default=30, gt=0)
+    # A tracker can be re-created when a queued truck remains in view.  Keep
+    # one persisted event for the same confirmed container/lane/direction for
+    # this long, while leaving normal (unidentified) passage dedup unchanged.
+    # This is a recovery window for tracker churn, not a visit identity.  The
+    # active lane/visit ID is the primary key; this fallback must stay short.
+    same_container_event_window_seconds: float = Field(default=600, ge=60, le=7200)
     track_ttl_seconds: float = Field(default=5, gt=0)
     snapshot_directory: Path = Path('snapshots')
+    categorized_snapshot_folders: bool = True
     upload_directory: Path = Path('uploads')
+    enable_video_recording: bool = False
+    log_directory: Path = Path('logs')
     max_upload_mb: int = Field(default=2048, ge=1, le=20480)
     camera_discovery_enabled: bool = True
     camera_discovery_interval_seconds: int = Field(default=60, ge=15, le=3600)
     camera_onvif_username: str = ''
     camera_onvif_password: SecretStr = SecretStr('')
     cors_origins: list[str] = ['http://localhost:4200', 'http://127.0.0.1:4200']
-    open_timeout_ms: int = Field(default=5000, ge=100, le=30000)
-    read_timeout_ms: int = Field(default=3000, ge=100, le=30000)
+    open_timeout_ms: int = Field(default=15000, ge=100, le=60000)
+    read_timeout_ms: int = Field(default=8000, ge=100, le=60000)
     reconnect_initial_seconds: float = Field(default=1, gt=0)
     reconnect_max_seconds: float = Field(default=30, gt=0)
     max_frame_width: int = Field(default=1920, ge=320, le=4096)
     prosper_enabled: bool = False
-    prosper_api_base_url: str = 'http://syapi.prosperassettracking.com'
+    prosper_auto_dispatch: bool = False
+    prosper_api_base_url: str = 'https://api.smartyard.prosperinfotech.com/gate/api/v1/gate/events'
+    prosper_auth_url: str = 'https://cfsapi.prosperassettracking.com/api/auth/login'
     prosper_site_id: str = ''
+    prosper_client_id: str = ''
     prosper_api_key: SecretStr | None = None
     prosper_bearer_token: SecretStr | None = None
     prosper_site_code: str | None = None

@@ -11,10 +11,10 @@ def test_valid_container(text):
     assert value.valid_format and value.valid_check_digit
 
 
-def test_six_digit_prefix_derives_check_digit():
+def test_missing_check_digit_is_not_invented():
     val = ContainerValidator().validate(OCRRead('GXYU 509070', .95))
-    assert val.normalized_text == 'GXYU5090704'
-    assert val.valid_format and val.valid_check_digit and val.validation_status == 'VALID'
+    assert val.normalized_text == 'GXYU509070'
+    assert not val.valid_format and not val.valid_check_digit
 
 
 @pytest.mark.parametrize('text,status', [('CSQU3054384', 'INVALID_CHECK_DIGIT'), ('CSQA3054383', 'INVALID_FORMAT'),
@@ -58,3 +58,20 @@ def test_feet_size_code_c_to_g_correction():
     assert val.normalized_text == '45G1'
     assert val.validation_status == 'VALID_SIZE_CODE'
 
+
+def test_inserted_digit_is_not_silently_removed():
+    val = ContainerValidator().validate(OCRRead('TRHU1 1545895', .95))
+    assert not val.valid_check_digit
+
+
+@pytest.mark.parametrize('raw', ['CSQU 305438 [3]', 'CSQU 305438 (3)', 'CSQU 305438 |3|'])
+def test_printed_check_digit_delimiters(raw):
+    val = ContainerValidator().validate(OCRRead(raw, .91))
+    assert val.normalized_text == 'CSQU3054383'
+    assert val.valid_check_digit
+    assert val.confidence == .91
+
+
+@pytest.mark.parametrize('raw', ['BEAUL 255352', 'MAERSK 305438', 'CSQ 305438 3', 'CSQU 305438 8'])
+def test_no_identity_guessing(raw):
+    assert not ContainerValidator().validate(OCRRead(raw, .99)).valid_check_digit

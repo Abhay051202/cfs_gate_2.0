@@ -1,6 +1,6 @@
-import { Component, input, output, signal } from '@angular/core';
+import { Component, inject, input, output, signal } from '@angular/core';
 import { DatePipe, PercentPipe } from '@angular/common';
-import { EventDetail } from './gate-api.service';
+import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
 
 @Component({
   selector: 'gate-event-detail',
@@ -34,7 +34,7 @@ import { EventDetail } from './gate-api.service';
           <div class="hero-main">
             <div class="hero-label">
               @if (item.is_twin) {
-                <span class="twin-header-pill">TWIN 20FT CONTAINER CHASSIS (2x 20FT)</span>
+                <span class="twin-header-pill">{{ item.status === 'CONFIRMED' && item.container_number_2 ? 'TWO CONTAINER IDENTITIES' : 'POSSIBLE TWIN · REVIEW REQUIRED' }}</span>
               } @else {
                 CONTAINER IDENTIFICATION & EVIDENCE
               }
@@ -46,7 +46,7 @@ import { EventDetail } from './gate-api.service';
                 <div class="twin-box-card">
                   <div class="twin-box-header">
                     <span class="slot-tag front">FRONT CONTAINER (SLOT 1)</span>
-                    <span class="size-pill feet">📏 20 FT {{ item.size_code ? '(' + item.size_code + ')' : '' }}</span>
+                    <span class="size-pill feet">📏 {{ item.container_size || 'Size unconfirmed' }} {{ item.size_code ? '(' + item.size_code + ')' : '' }}</span>
                   </div>
                   <div class="hero-container-title">
                     <span class="container-badge mono">{{ item.container_number || 'UNCONFIRMED' }}</span>
@@ -57,7 +57,7 @@ import { EventDetail } from './gate-api.service';
                 <div class="twin-box-card">
                   <div class="twin-box-header">
                     <span class="slot-tag rear">REAR CONTAINER (SLOT 2)</span>
-                    <span class="size-pill feet">📏 20 FT {{ item.size_code_2 ? '(' + item.size_code_2 + ')' : '' }}</span>
+                    <span class="size-pill feet">📏 {{ item.container_size_2 || 'Size unconfirmed' }} {{ item.size_code_2 ? '(' + item.size_code_2 + ')' : '' }}</span>
                   </div>
                   <div class="hero-container-title">
                     <span class="container-badge mono">{{ item.container_number_2 || 'UNCONFIRMED' }}</span>
@@ -66,7 +66,7 @@ import { EventDetail } from './gate-api.service';
               </div>
 
               <div class="hero-meta-row twin-meta-row">
-                <span class="status-pill confirmed">{{ item.status.replaceAll('_', ' ') }}</span>
+                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="(item.status !== 'CONFIRMED' && item.capture_policy !== 'BEST_AVAILABLE')">{{ item.status.replaceAll('_', ' ') }}</span>
                 <span class="movement-pill">{{ item.event_type }}</span>
                 <span class="meta-item"><strong>Lane:</strong> {{ item.gate_id }}</span>
                 <span class="meta-dot">·</span>
@@ -76,8 +76,8 @@ import { EventDetail } from './gate-api.service';
               </div>
             } @else {
               <h1 class="hero-container-title">
-                <span class="container-badge mono">{{ item.container_number || 'UNCONFIRMED / REVIEW NEEDED' }}</span>
-                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="item.status !== 'CONFIRMED'">
+                <span class="container-badge mono">{{ item.container_number || item.candidate_number || 'NUMBER NOT READ' }}</span>
+                <span class="status-pill" [class.confirmed]="item.status === 'CONFIRMED'" [class.review]="(item.status !== 'CONFIRMED' && item.capture_policy !== 'BEST_AVAILABLE')">
                   {{ item.status.replaceAll('_', ' ') }}
                 </span>
                 <span class="movement-pill">{{ item.event_type }}</span>
@@ -102,12 +102,70 @@ import { EventDetail } from './gate-api.service';
           </div>
         </div>
 
+        @if (item.review_reason) {
+          <div class="review-explanation" role="status"><strong>Review required</strong><p>{{ item.review_reason }}</p></div>
+        }
+        @if (!item.container_number && item.candidate_number) {
+          <p>This OCR number is unverified and has not been sent to cloud.</p>
+        }
+        @if (item.capture_policy === 'UNREADABLE_CAPTURE') {
+          <div class="review-explanation" role="status"><strong>Container number unreadable</strong><p>The visit is captured with its best available proof. It can be sent with the number explicitly marked unreadable.</p></div>
+        }
+
+        <!-- Cloud Dispatch Review & Action Banner -->
+        <div class="cloud-dispatch-banner" [class.synced]="item.cloud_synced" [class.paused]="!item.cloud_synced">
+          <div class="cloud-banner-left">
+            @if (item.cloud_synced) {
+              <div class="cloud-status-badge synced">
+                <span class="badge-icon">✓</span>
+                <span>SENT TO SITE</span>
+              </div>
+              <div class="cloud-banner-text">
+                <strong>Event published to Prosper Smart Yard cloud site</strong>
+                @if (item.cloud_event_id) {
+                  <span class="cloud-id mono">Cloud ID: {{ item.cloud_event_id }}</span>
+                }
+                @if (item.cloud_synced_at) {
+                  <span class="cloud-synced-time">Synced: {{ item.cloud_synced_at | date:'HH:mm:ss · dd MMM' }}</span>
+                }
+              </div>
+            } @else {
+              <div class="cloud-status-badge paused">
+                <span class="badge-icon">⏸</span>
+                <span>{{ cloudEnabled() ? 'SENDING PAUSED' : 'LOCAL ONLY' }}</span>
+              </div>
+              <div class="cloud-banner-text">
+                <strong>{{ cloudEnabled() ? 'Review before sending' : 'Cloud sending is disabled' }}</strong>
+                <span>{{ cloudEnabled() ? 'Review the number and proof before sending this event.' : 'Events and proof images stay on this device while you review.' }}</span>
+              </div>
+            }
+          </div>
+          <div class="cloud-banner-right">
+            <button class="send-to-site-btn" [class.resend]="item.cloud_synced" [disabled]="dispatching() || !cloudEnabled() || item.cloud_proof_complete === false || (item.status !== 'CONFIRMED' && !['BEST_AVAILABLE', 'FINAL_CAPTURE', 'UNREADABLE_CAPTURE'].includes(item.capture_policy || ''))" (click)="dispatchToSite(item)">
+              @if (dispatching()) {
+                <span class="spinner">⏳</span> Sending to Site...
+              } @else if (item.cloud_synced) {
+                <span>🔄 Re-send to Site</span>
+              } @else {
+                <span>📤 Send to Site</span>
+              }
+            </button>
+          </div>
+        </div>
+
+        @if (dispatchMessage()) {
+          <div class="dispatch-message-bar" [class.success]="dispatchSuccess()" [class.error]="!dispatchSuccess()">
+            <span>{{ dispatchMessage() }}</span>
+            <button class="close-msg-btn" (click)="clearDispatchMessage()">✕</button>
+          </div>
+        }
+
         @if (showJson()) {
           <div class="json-viewer-panel">
             <div class="json-header">
               <div>
                 <strong>event.json</strong>
-                <small class="json-path">snapshots/{{ item.id }}/event.json</small>
+                <small class="json-path">snapshots/{{ item.visit_id || item.id }}/{{ item.visit_id ? 'event_' + item.id + '.json' : 'event.json' }}</small>
               </div>
               <div class="json-actions">
                 <button class="copy-btn" (click)="copyJson(item)">
@@ -188,86 +246,30 @@ import { EventDetail } from './gate-api.service';
           <div class="evidence-right">
             <div class="panel-card">
               <div class="panel-card-title">
-                <h3>Multi-Camera Snapshots & Proof</h3>
-                <span class="badge">{{ item.snapshots.length }} viewpoints</span>
+                <h3>Cloud upload proof</h3>
+                <span class="badge">{{ item.cloud_proof_images?.length || 0 }} images</span>
               </div>
-
-              @if (item.is_twin) {
-                <div class="twin-proof-grid">
-                  <!-- Front Container Proof Card -->
-                  @if (getFrontSnapshot(item); as frontSnap) {
-                    <div class="primary-proof-card twin-proof-card front-proof">
-                      <div class="proof-header front-header">
-                        <span class="proof-badge">FRONT (SLOT 1): <strong class="mono">{{ item.container_number || 'PENDING OCR' }}</strong></span>
-                        <span class="proof-cam mono">{{ frontSnap.camera_id }}</span>
-                      </div>
-                      <div class="proof-img-wrap">
-                        <img [src]="'/api/snapshots/' + frontSnap.id" [alt]="'Front container proof from ' + frontSnap.camera_id">
-                      </div>
-                      <div class="proof-caption">
-                        <span><strong class="mono">{{ item.container_number || 'Front Container' }}</strong> · {{ frontSnap.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
-                        <a [href]="'/api/snapshots/' + frontSnap.id" target="_blank" class="view-raw-link">Full resolution ↗</a>
-                      </div>
-                    </div>
-                  }
-
-                  <!-- Rear Container Proof Card -->
-                  @if (getRearSnapshot(item); as rearSnap) {
-                    <div class="primary-proof-card twin-proof-card rear-proof">
-                      <div class="proof-header rear-header">
-                        <span class="proof-badge">REAR (SLOT 2): <strong class="mono">{{ item.container_number_2 || 'PENDING OCR' }}</strong></span>
-                        <span class="proof-cam mono">{{ rearSnap.camera_id }}</span>
-                      </div>
-                      <div class="proof-img-wrap">
-                        <img [src]="'/api/snapshots/' + rearSnap.id" [alt]="'Rear container proof from ' + rearSnap.camera_id">
-                      </div>
-                      <div class="proof-caption">
-                        <span><strong class="mono">{{ item.container_number_2 || 'Rear Container' }}</strong> · {{ rearSnap.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
-                        <a [href]="'/api/snapshots/' + rearSnap.id" target="_blank" class="view-raw-link">Full resolution ↗</a>
-                      </div>
-                    </div>
-                  }
-                </div>
-              } @else {
-                @if (getPrimarySnapshot(item); as primary) {
-                  <div class="primary-proof-card">
-                    <div class="proof-header">
-                      <span class="proof-badge">PRIMARY CONTAINER PROOF</span>
-                      <span class="proof-cam mono">{{ primary.camera_id }}</span>
-                    </div>
-                    <div class="proof-img-wrap">
-                      <img [src]="'/api/snapshots/' + primary.id" [alt]="'Container proof from ' + primary.camera_id">
-                    </div>
-                    <div class="proof-caption">
-                      <span><strong>{{ item.container_number || 'Detected Container' }}</strong> · {{ primary.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
-                      <a [href]="'/api/snapshots/' + primary.id" target="_blank" class="view-raw-link">Full resolution ↗</a>
-                    </div>
-                  </div>
+              <p class="image-refresh-note">Exact images selected by the cloud upload builder. Preview only; no data is sent.</p>
+              @for (coverage of item.cloud_proof_coverage || []; track $index) {
+                @if (coverage.required > 0) {
+                  <p class="image-refresh-note" [class.review-explanation]="!coverage.complete">
+                    {{ coverage.container_number }}: number proof from {{ coverage.cameras.length }} of {{ coverage.required }} required cameras.
+                    @if (!coverage.complete) { Sending is held until a second camera provides matching number proof. }
+                  </p>
                 }
               }
-
-              <h4 class="multi-angle-title">All Gate Camera Angles ({{ item.snapshots.length }})</h4>
-              <div class="snapshots-grid">
-                @for (s of item.snapshots; track s.id) {
-                  <figure class="snapshot-card" [class.is-primary]="s.id === item.primary_snapshot_id || s.id === item.rear_snapshot_id">
-                    <div class="snapshot-img-wrap">
-                      <img [src]="'/api/snapshots/' + s.id" [alt]="'Snapshot from ' + s.camera_id" loading="lazy">
-                      <span class="camera-tag">{{ s.camera_id }}</span>
-                      @if (s.id === item.primary_snapshot_id) {
-                        <span class="primary-tag">FRONT PROOF</span>
-                      } @else if (s.id === item.rear_snapshot_id) {
-                        <span class="primary-tag rear-tag">REAR PROOF</span>
-                      }
-                    </div>
-                    <figcaption>
-                      <span class="snap-time">{{ s.timestamp | date:'HH:mm:ss · dd MMM yyyy' }}</span>
-                      <a [href]="'/api/snapshots/' + s.id" target="_blank" class="view-raw-link">Full resolution ↗</a>
-                    </figcaption>
-                  </figure>
-                } @empty {
-                  <p class="empty-hint">No camera snapshots recorded for this event.</p>
-                }
-              </div>
+              @for (proof of item.cloud_proof_images || []; track $index) {
+                <figure class="primary-proof-card">
+                  <div class="proof-header">
+                    <span class="proof-badge">{{ proof.position }} · {{ proof.container_number }}</span>
+                    <span class="proof-cam">{{ proof.camera_id }} · {{ proof.image_type }}</span>
+                  </div>
+                  <div class="proof-img-wrap"><img [src]="proof.image" [alt]="'Cloud upload proof for ' + proof.container_number + ' from ' + proof.camera_id"></div>
+                  <figcaption class="proof-caption">{{ proof.captured_at | date:'HH:mm:ss · dd MMM yyyy' }}</figcaption>
+                </figure>
+              } @empty {
+                <p class="review-explanation" role="status">{{ item.cloud_proof_error || 'No usable cloud proof images are available.' }}</p>
+              }
             </div>
           </div>
         </div>
@@ -276,13 +278,94 @@ import { EventDetail } from './gate-api.service';
   `
 })
 export class EventDetailComponent {
+  private gateApi = inject(GateApi);
+
   event = input<EventDetail | null>(null);
   back = output<void>();
   showJson = signal(false);
   copied = signal(false);
+  imageLoaded = signal<Record<string, boolean>>({});
+  imageErrors = signal<Record<string, boolean>>({});
+
+  cloudEnabled = signal(false);
+
+  constructor() {
+    this.gateApi.cloudSyncStatus().subscribe({next: status => this.cloudEnabled.set(status.enabled), error: () => this.cloudEnabled.set(false)});
+  }
+
+  dispatching = signal(false);
+  dispatchSuccess = signal(false);
+  dispatchMessage = signal<string | null>(null);
+
+  snapshotUrl(id: string): string {
+    return `/api/snapshots/${id}?proof=true`;
+  }
+
+  rawSnapshotUrl(id: string): string {
+    return `/api/snapshots/${encodeURIComponent(id)}`;
+  }
+
+  markImageLoaded(id: string) {
+    this.imageLoaded.update(state => ({ ...state, [id]: true }));
+  }
+
+  markImageError(id: string) {
+    this.imageErrors.update(state => ({ ...state, [id]: true }));
+  }
 
   toggleJson() {
     this.showJson.update(v => !v);
+  }
+
+  dispatchToSite(item: EventDetail) {
+    if (!item?.id || this.dispatching() || !this.cloudEnabled() || (item.status !== 'CONFIRMED' && !['BEST_AVAILABLE', 'FINAL_CAPTURE', 'UNREADABLE_CAPTURE'].includes(item.capture_policy || ''))) return;
+    this.dispatching.set(true);
+    this.dispatchMessage.set(null);
+
+    this.gateApi.dispatchCloud(item.id).subscribe({
+      next: (res) => {
+        this.dispatching.set(false);
+        this.dispatchSuccess.set(true);
+        this.dispatchMessage.set(res.message || '✓ Event successfully dispatched to cloud site!');
+        item.cloud_synced = true;
+        if (res.cloud_event_id) {
+          item.cloud_event_id = res.cloud_event_id;
+        }
+        setTimeout(() => {
+          if (this.dispatchSuccess()) {
+            this.dispatchMessage.set(null);
+          }
+        }, 5000);
+      },
+      error: (err) => {
+        this.dispatching.set(false);
+        this.dispatchSuccess.set(false);
+        const detail = err?.error?.detail || err?.error?.message || err?.message || 'Failed to dispatch event to site';
+        this.dispatchMessage.set('⚠ Error: ' + detail);
+        setTimeout(() => {
+          if (this.dispatchMessage()?.startsWith('⚠ Error:')) {
+            this.dispatchMessage.set(null);
+          }
+        }, 8000);
+      }
+    });
+  }
+
+  clearDispatchMessage() {
+    this.dispatchMessage.set(null);
+  }
+
+  getCropForContainer(item: EventDetail, slot: 1 | 2): OcrCrop | null {
+    if (!item?.ocr_crops?.length) return null;
+    const targetNumber = slot === 1 ? item.container_number : item.container_number_2;
+    if (targetNumber) {
+      const match = item.ocr_crops.find(c => c.normalized_text === targetNumber);
+      if (match) return match;
+    }
+    const slotStr = slot === 1 ? 'FRONT' : 'REAR';
+    const slotMatch = item.ocr_crops.find(c => c.slot_position?.toUpperCase() === slotStr);
+    if (slotMatch) return slotMatch;
+    return slot === 1 ? item.ocr_crops[0] : (item.ocr_crops.length > 1 ? item.ocr_crops[1] : null);
   }
 
   getPrimarySnapshot(item: EventDetail) {
@@ -312,7 +395,9 @@ export class EventDetailComponent {
     }
     const rear = item.snapshots.find(s => s.image_path?.endsWith('_rear.jpg'));
     if (rear) return rear;
-    return item.snapshots.length > 1 ? item.snapshots[1] : null;
+    const frontSnap = this.getFrontSnapshot(item);
+    const diff = item.snapshots.find(s => s.id !== frontSnap?.id);
+    return diff || (item.snapshots.length > 1 ? item.snapshots[1] : null);
   }
 
   hasFeetDetection(item: EventDetail | null): boolean {
@@ -332,4 +417,3 @@ export class EventDetailComponent {
     });
   }
 }
-

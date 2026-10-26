@@ -1,7 +1,15 @@
+from __future__ import annotations
 from contextlib import asynccontextmanager
 import asyncio
+import functools
 import logging
 from pathlib import Path
+
+if not hasattr(asyncio, 'to_thread'):
+    async def _to_thread(func, /, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
+    asyncio.to_thread = _to_thread
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +17,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.api import cameras, detections, events, health, videos
+from app.api import alerts, cameras, detections, events, health, videos
 from app.config.settings import Settings
 from app.database.database import Database
 from app.database.repositories.gate import GateRepository
@@ -26,12 +34,15 @@ def create_app(settings=None, database=None, camera_configs=None, runtime_factor
 
     @asynccontextmanager
     async def lifespan(app):
-        configure_logging()
+        configure_logging(settings.log_directory)
         db = database or Database(settings.database_url.get_secret_value())
         configs = camera_configs if camera_configs is not None else settings.cameras()
         sources = camera_sources if camera_sources is not None else settings.camera_sources(configs)
         repository = GateRepository(db)
-        snapshots = SnapshotManager(settings.snapshot_directory)
+        snapshots = SnapshotManager(settings.snapshot_directory, categorized=settings.categorized_snapshot_folders)
+        # Expose the evidence root for legacy filesystem-only snapshot
+        # recovery in the repository/API layer.
+        db.snapshot_directory = snapshots.root
         runtime = runtime_factory(settings, configs, repository, snapshots, camera_sources=sources)
         app.state.database, app.state.repository = db, repository
         app.state.snapshots, app.state.runtime = snapshots, runtime
@@ -69,7 +80,7 @@ def create_app(settings=None, database=None, camera_configs=None, runtime_factor
             return JSONResponse({'detail': 'Request origin is not allowed'}, status_code=403)
         return await call_next(request)
 
-    for router in (cameras.router, events.router, detections.router, health.router, videos.router):
+    for router in (cameras.router, events.router, detections.router, health.router, videos.router, alerts.router):
         app.include_router(router)
 
     @app.exception_handler(SQLAlchemyError)

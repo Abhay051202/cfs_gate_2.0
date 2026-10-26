@@ -95,6 +95,27 @@ def test_real_opencv_recorded_video_eof(settings, camera, tmp_path):
         assert worker.join()
 
 
+def test_real_opencv_recorded_video_looping(settings, camera, tmp_path):
+    import cv2
+    path = str(tmp_path / 'loop.avi')
+    writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'MJPG'), 20, (100, 100))
+    assert writer.isOpened()
+    for _ in range(4):
+        writer.write(np.zeros((100, 100, 3), dtype=np.uint8))
+    writer.release()
+    camera.source_type = 'file'
+    camera.loop_file = True
+    worker = CameraWorker(camera, path, settings, OpenCVStream)
+    worker.start()
+    try:
+        wait_until(lambda: worker.status()['frames_captured'] >= 8)
+        assert worker.status()['status'] == 'ONLINE'
+        assert worker.status()['reconnect_count'] == 0
+    finally:
+        worker.stop()
+        assert worker.join()
+
+
 def test_four_camera_frames_to_database_and_snapshot(settings, repository, snapshots):
     configs = [CameraConfig(id=f'camera-{i}', name=f'View {i}', gate_id=f'lane-{(i-1)//2}', source_env=f'CAMERA_{i}_RTSP', capture_fps=60) for i in range(1, 5)]
     repository.sync_cameras(configs)
@@ -112,11 +133,20 @@ def test_four_camera_frames_to_database_and_snapshot(settings, repository, snaps
     runtime = GateRuntime(settings, configs, repository, snapshots, manager, Detector, OCR)
     runtime.start()
     try:
-        wait_until(lambda: len(list(snapshots.root.rglob('*.jpg'))) == 4)
+        wait_until(lambda: len(list(snapshots.root.rglob('*.jpg'))) >= 4)
         wait_until(lambda: repository.events()['total'] == 2)
         time.sleep(.15)
         assert repository.events()['total'] == 2
-        assert len(list(snapshots.root.rglob('*.jpg'))) == 4
+        # A camera can contribute both captured context and its own OCR proof.
+        # Check camera coverage and file integrity, not a timing-dependent count.
+        def camera_evidence():
+            event_rows = repository.events()['items']
+            return [s for event in event_rows for s in repository.event(event['id'])['snapshots']]
+        # Events can exist before the other camera's asynchronous OCR finishes.
+        wait_until(lambda: {s['camera_id'] for s in camera_evidence()} == {c.id for c in configs})
+        evidence = camera_evidence()
+        assert {s['camera_id'] for s in evidence} == {c.id for c in configs}
+        assert all(snapshots.path(s['image_path']).is_file() for s in evidence)
         assert len(runtime.metrics.snapshot()['inference_fps']) == 4
     finally:
         assert runtime.stop()
