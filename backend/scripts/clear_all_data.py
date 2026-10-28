@@ -14,11 +14,11 @@ def clear_all():
     if db_path.exists():
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute("DELETE FROM system_logs")
-        cur.execute("DELETE FROM ocr_results")
-        cur.execute("DELETE FROM snapshots")
-        cur.execute("DELETE FROM detections")
-        cur.execute("DELETE FROM gate_events")
+        for tbl in ['system_logs', 'ocr_results', 'snapshots', 'detections', 'acknowledged_proofs', 'gate_events']:
+            try:
+                cur.execute(f"DELETE FROM {tbl}")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
         cur.execute("VACUUM")
         conn.commit()
