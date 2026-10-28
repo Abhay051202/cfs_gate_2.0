@@ -1085,12 +1085,14 @@ class GateRuntime:
                     continue
                 text_regions = [r for p in group for r in p.regions if not r.context_only]
                 def _region_confirmed(r):
+                    if self.settings.strict_ocr_acceptance:
+                        return r.confirmed(self.settings.ocr_confirmations)
                     if r.confirmed(self.settings.ocr_confirmations):
                         return True
                     return any(getattr(v, 'valid_check_digit', False) and getattr(v, 'confidence', 0) >= 0.50
                                for v, _ in r.reads.values())
                 confirmed_regions = [r for r in text_regions if _region_confirmed(r)]
-                if confirmed_regions:
+                if confirmed_regions and not self.settings.strict_ocr_acceptance:
                     for p in group:
                         for r in p.regions:
                             r.candidates.clear()
@@ -1105,6 +1107,8 @@ class GateRuntime:
                 min_cameras = int(getattr(self.settings, 'minimum_number_proof_cameras', 1) or 1)
                 coverage = bool(number_cameras) and all(len(cams)>=min_cameras for cams in number_cameras.values())
                 early = self.settings.vehicle_visit_tracking and complete and coverage
+                if self.settings.strict_ocr_acceptance:
+                    early = False  # Keep observing other cameras through departure.
                 departed = all(p.closed and (not self.settings.vehicle_visit_tracking or p.closed_at is None or
                     (utcnow()-p.closed_at).total_seconds()>=self.settings.reversal_grace_seconds) and
                     all(not r.pending and (not r.candidates or r.confirmed(self.settings.ocr_confirmations))
@@ -1563,7 +1567,7 @@ class GateRuntime:
                     passage = self.passages.passages.get(job.passage_id)
                     if passage:
                         for r in passage.regions:
-                            if r.id == job.region_id:
+                            if r.id == job.region_id and (not self.settings.strict_ocr_acceptance or r.confirmed(self.settings.ocr_confirmations)):
                                 r.candidates.clear()
                                 r.pending = 0
                                 self.ocr_store.cancel_pending(f'passage:{passage.id}:{r.id}', job.passage_id)

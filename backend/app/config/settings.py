@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     minimum_number_proof_cameras: int = Field(default=1, ge=1, le=16)
     shared_visit_folders: bool = True
     container_roi_trigger: bool = True
+    minimum_text_trigger_height_ratio: float = Field(default=0.025, ge=0, le=0.2)
     reversal_grace_seconds: float = Field(default=30, ge=0, le=300)
     cross_camera_arrival_window_seconds: float = Field(default=30, ge=1, le=120)
     model_backend: Literal['pytorch', 'onnx', 'tensorrt'] = 'pytorch'
@@ -167,6 +168,8 @@ class Settings(BaseSettings):
     reconnect_max_seconds: float = Field(default=30, gt=0)
     max_frame_width: int = Field(default=1920, ge=320, le=4096)
     prosper_enabled: bool = False
+    local_test_mode: bool = False
+    strict_ocr_acceptance: bool = True
     prosper_auto_dispatch: bool = False
     prosper_api_base_url: str = 'https://api.smartyard.prosperinfotech.com/gate/api/v1/gate/events'
     prosper_auth_url: str = 'https://cfsapi.prosperassettracking.com/api/auth/login'
@@ -184,6 +187,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode='after')
     def validate_settings(self):
+        if self.local_test_mode:
+            self.prosper_enabled = False
+            self.prosper_auto_dispatch = False
         if self.ocr_max_attempts < self.ocr_confirmations:
             raise ValueError('ocr_max_attempts must cover ocr_confirmations')
         from sqlalchemy.engine import make_url

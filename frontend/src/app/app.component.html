@@ -86,6 +86,12 @@
 </aside>
 
 <main>
+  @if (cloudSync()?.local_test_mode) {
+    <div class="review-explanation" role="status">
+      <strong>LOCAL TEST — Cloud uploads blocked</strong>
+      <p>New events stay on this computer. Open an event to review the saved images prepared for upload. Coordinated camera timing and the axle trigger are not yet validated.</p>
+    </div>
+  }
   @if (cloudSync(); as cs) {
     @if (cs.enabled && !cs.is_online && cs.pending_count > 0) {
       <div class="offline-recovery-banner" role="alert">

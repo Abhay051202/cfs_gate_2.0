@@ -48,6 +48,9 @@ def event(event_id: str, request: Request):
     result['ocr_crops'] = request.app.state.runtime.ocr_store.event_crops(event_id)
     dispatcher = getattr(request.app.state.runtime, 'dispatcher', None)
     result['cloud_auto_dispatch'] = getattr(dispatcher, 'auto_dispatch', False) if dispatcher else False
+    result['local_test_mode'] = bool(request.app.state.runtime.settings.local_test_mode)
+    result['proof_frozen'] = False
+    result['proof_payload_sha256'] = None
     # Preview uses the upload builder itself: no queueing, login or network calls.
     result['cloud_proof_images'] = []
     result['cloud_proof_error'] = None
@@ -56,6 +59,10 @@ def event(event_id: str, request: Request):
     if dispatcher:
         try:
             payload = dispatcher.build_proof_preview(event_id)
+            if result['local_test_mode']:
+                from app.snapshots.outgoing_preview import OutgoingPreview
+                result['proof_frozen'] = True
+                result['proof_payload_sha256'] = OutgoingPreview.digest(payload)
             for container in payload.get('Containers', []):
                 cameras = sorted({image.get('CameraId') for image in container.get('Images',[]) if image.get('CameraId')})
                 required = request.app.state.runtime.settings.minimum_number_proof_cameras if container.get('ContainerNumber') else 0
@@ -63,7 +70,7 @@ def event(event_id: str, request: Request):
                     'cameras':cameras,'required':required,'complete':len(cameras)>=required})
                 for image in container.get('Images', []):
                     result['cloud_proof_images'].append({
-                        'container_number': container.get('ContainerNumber'),
+                        'container_number': ('UNVERIFIED: ' + str(container.get('ContainerNumber') or '')) if result.get('ocr_acceptance', {}).get('accepted') is False else container.get('ContainerNumber'),
                         'position': container.get('Position'),
                         'camera_id': image.get('CameraId'),
                         'image_type': image.get('ImageType'),
@@ -76,6 +83,17 @@ def event(event_id: str, request: Request):
     else:
         result['cloud_proof_error'] = 'Cloud proof preview is unavailable.'
     return result
+
+
+@router.get('/gate-events/{event_id}/upload-preview')
+def upload_preview(event_id: str, request: Request):
+    runtime = request.app.state.runtime
+    if not request.app.state.repository.event(event_id):
+        raise HTTPException(404, 'Event not found')
+    try:
+        return runtime.dispatcher.build_proof_preview(event_id)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 @router.post('/gate-events/{event_id}/dispatch-cloud')

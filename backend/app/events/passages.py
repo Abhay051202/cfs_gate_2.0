@@ -28,6 +28,11 @@ def contains_text(body, text):
     return body[0] <= x <= body[2] and body[1] <= y <= body[3]
 
 
+def text_can_open_visit(box, shape, minimum_height_ratio):
+    """Small background text may enrich a visit, but cannot open one alone."""
+    return box[3] - box[1] >= shape[0] * minimum_height_ratio
+
+
 @dataclass
 class Region:
     id: str = field(default_factory=lambda: uuid4().hex)
@@ -224,6 +229,8 @@ class PassageCollector:
                     has_valid_trigger_text = any(
                         d.class_name == 'container_number'
                         and d.confidence >= 0.35
+                        and (has_container_body or text_can_open_visit(
+                            d.bbox, frame.image.shape, self.settings.minimum_text_trigger_height_ratio))
                         and inside_gate(d.bbox, frame.image.shape, camera.occupancy_roi)
                         and contains_text(tbx, d.bbox)
                         and not self._is_stationary_background_text(camera.id, frame.timestamp, d.bbox)

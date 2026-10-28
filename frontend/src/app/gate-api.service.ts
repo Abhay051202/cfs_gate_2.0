@@ -72,6 +72,9 @@ export interface OCR { id: string; raw_text: string; normalized_text: string; co
 export interface Snapshot { id: string; camera_id: string; timestamp: string; image_path?: string; }
 export interface OcrCrop { id: string; camera_id?: string; timestamp?: string; slot_position: string; normalized_text?: string | null; }
 export interface EventDetail extends GateEvent {
+  local_test_mode?: boolean;
+  proof_frozen?: boolean;
+  proof_payload_sha256?: string | null;
   cloud_proof_complete?: boolean;
   cloud_proof_coverage?: {container_number: string | null; cameras: string[]; required: number; complete: boolean}[];
   cloud_proof_images?: {container_number: string; position: string; camera_id: string; image_type: string; captured_at: string; image: string}[];
@@ -88,6 +91,7 @@ export interface EventDetail extends GateEvent {
 export interface EventPage { items: GateEvent[]; total: number; offset: number; limit: number; }
 export interface OcrSpool { total: number; pending: number; failed: number; }
 export interface CloudSyncStatus {
+  local_test_mode?: boolean;
   enabled: boolean;
   auto_dispatch?: boolean;
   is_paused?: boolean;

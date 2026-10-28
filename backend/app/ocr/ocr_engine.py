@@ -97,14 +97,9 @@ class PaddleOCREngine:
                     return '', 0.0, False
                 v = validator.validate(OCRRead(txt, conf))
                 if v.valid_check_digit:
-                    cal_conf = max(conf, min(0.99, 0.92 + 0.07 * conf)) if conf >= 0.45 else conf
-                    return v.normalized_text, cal_conf, True
-                rep = repair_container_candidate(txt, v.normalized_text)
-                if rep:
-                    rep_v = validator.validate(OCRRead(rep, conf))
-                    if rep_v.valid_check_digit:
-                        cal_conf = max(conf, min(0.96, 0.88 + 0.08 * conf)) if conf >= 0.45 else conf
-                        return rep, cal_conf, True
+                    return txt, conf, True
+                # Keep the actual observed text. Checksum repairs can propose a
+                # different identifier but must never become observed evidence.
                 return txt, conf, False
 
             # 1. Fast path: Direct crop recognition without sub-detection (~35ms)

@@ -73,7 +73,7 @@ def resume_cloud_sync(request: Request):
     runtime = request.app.state.runtime
     if hasattr(runtime, 'dispatcher') and runtime.dispatcher:
         runtime.dispatcher.resume()
-        return {'paused': False, 'auto_dispatch': True}
+        return {'paused': runtime.dispatcher.is_paused, 'auto_dispatch': runtime.dispatcher.auto_dispatch}
     return {'paused': False, 'auto_dispatch': True}
 
 

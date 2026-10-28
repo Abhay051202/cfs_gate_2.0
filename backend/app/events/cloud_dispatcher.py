@@ -23,6 +23,12 @@ import cv2
 import numpy as np
 import requests
 from app.snapshots.proof import proof_jpeg
+from app.snapshots.outgoing_preview import OutgoingPreview
+
+
+class LocalOnlyAdapter(requests.adapters.HTTPAdapter):
+    def send(self, *args, **kwargs):
+        raise requests.exceptions.RequestException('Cloud requests blocked by local test mode')
 
 log = logging.getLogger('gate.cloud')
 
@@ -213,6 +219,9 @@ class ProsperSession:
         self.site_id = (settings.prosper_site_id or '').strip()
         self.client_id = (getattr(settings, 'prosper_client_id', None) or '').strip()
         self.session = requests.Session()
+        if getattr(settings, 'local_test_mode', False):
+            self.session.mount('https://', LocalOnlyAdapter())
+            self.session.mount('http://', LocalOnlyAdapter())
         self._token: Optional[str] = None
         self._token_expires_at: float = 0.0
         self._last_auth_attempt: float = 0.0
@@ -224,6 +233,8 @@ class ProsperSession:
         self._lock = threading.Lock()
 
     def get_auth_headers(self) -> Dict[str, str]:
+        if getattr(self.settings, 'local_test_mode', False):
+            return {}
         """Return Authorization or API key headers, along with X-Site-Id and X-Client-Id."""
         headers: Dict[str, str] = {}
         if self.settings.prosper_bearer_token and not self._force_dynamic_auth:
@@ -433,6 +444,8 @@ class ProsperSession:
             log.warning('prosper_sync_file_log_failed', extra={'error': str(e)})
 
     def post_gate_event(self, payload: Dict[str, Any]) -> bool | str:
+        if getattr(self.settings, 'local_test_mode', False):
+            return 'LOCAL_ONLY'
         """Send Gate Event to Prosper Smart Yard."""
         headers = self.get_auth_headers()
         if 'Authorization' not in headers and 'x-api-key' not in headers:
@@ -553,6 +566,8 @@ class ProsperSession:
         return False
 
     def put_gate_event_images(self, cloud_event_id: str, payload: Dict[str, Any]) -> bool | str | dict:
+        if getattr(self.settings, 'local_test_mode', False):
+            return 'LOCAL_ONLY'
         """Upload or override container images on an existing cloud Gate Event via PUT /events/{eventId}/images."""
         if not cloud_event_id:
             return False
@@ -654,7 +669,7 @@ class CloudOutboxDispatcher:
         self.repository = repository
         self.snapshots = snapshots
         self.runtime = runtime
-        self.enabled = bool(settings.prosper_enabled)
+        self.enabled = bool(settings.prosper_enabled) and not getattr(settings, 'local_test_mode', False)
         self.auto_dispatch: bool = bool(getattr(settings, 'prosper_auto_dispatch', False))
         self.session = ProsperSession(settings, audit_callback=self._on_dispatch_audit) if self.enabled else None
         self.queue: Queue = Queue(maxsize=settings.prosper_queue_size)
@@ -695,6 +710,8 @@ class CloudOutboxDispatcher:
 
     def resume(self):
         """Resume automatic background dispatch to remote cloud site."""
+        if getattr(self.settings, 'local_test_mode', False):
+            return
         self.auto_dispatch = True
         log.info('prosper_cloud_auto_dispatch_resumed')
 
@@ -711,6 +728,7 @@ class CloudOutboxDispatcher:
                 pass
         return {
             'enabled': self.enabled,
+            'local_test_mode': bool(getattr(self.settings, 'local_test_mode', False)),
             'auto_dispatch': self.auto_dispatch,
             'is_paused': not self.auto_dispatch,
             'is_online': self._is_online if self.enabled else False,
@@ -755,8 +773,12 @@ class CloudOutboxDispatcher:
         4. If twin event, must have both valid distinct container numbers.
         5. Must have OCR confidence >= min_confidence (50% / 0.50).
         """
-        if not ev:
+        if not ev or ev.get('status') == 'DUPLICATE':
             return False
+        if getattr(self.settings, 'strict_ocr_acceptance', False) and getattr(self.settings, 'deployment_mode', '') != 'test':
+            from app.ocr.acceptance import assess_identity
+            if not assess_identity(ev)['accepted']:
+                return False
         if not allow_synced and ev.get('cloud_synced'):
             return False
         if ev.get('status') == 'UNREADABLE':
@@ -1251,9 +1273,21 @@ class CloudOutboxDispatcher:
                 return (3, c)
 
             images = []
+            has_front_cam = any(any(k in c.lower() for k in ('1', 'front', 'top', 'out-2')) for c in by_camera.keys())
+            has_rear_cam = any(any(k in c.lower() for k in ('3', 'rear', 'back', 'out-1')) for c in by_camera.keys())
             for cam_id in sorted(by_camera.keys(), key=_cam_sort_key):
                 score, snap, data = by_camera[cam_id]
-                img_type = resolve_camera_image_type(cam_id, cam_cfgs)
+                c_low = cam_id.lower()
+                if any(k in c_low for k in ('1', 'front', 'top', 'out-2')):
+                    img_type = 'FRONT'
+                elif any(k in c_low for k in ('3', 'rear', 'back', 'out-1')):
+                    img_type = 'REAR'
+                elif has_front_cam and not has_rear_cam:
+                    img_type = 'REAR'
+                elif not has_front_cam and has_rear_cam:
+                    img_type = 'FRONT'
+                else:
+                    img_type = resolve_camera_image_type(cam_id, cam_cfgs)
                 encoded_jpeg = proof_jpeg(data, snap, event)
                 images.append({
                     'ImageType': img_type,
@@ -1286,6 +1320,8 @@ class CloudOutboxDispatcher:
 
     def build_proof_preview(self, event_id):
         """Show matching source evidence without making a visit dispatchable."""
+        if getattr(self.settings, 'local_test_mode', False):
+            return self.build_event_payload(event_id)
         event = self.repository.event(event_id) if self.repository else None
         if event and event.get('capture_policy') in ('FINAL_CAPTURE','UNREADABLE_CAPTURE'):
             return self._final_capture_payload(event)  # Same bytes; coverage gate does not substitute images.
@@ -1298,6 +1334,26 @@ class CloudOutboxDispatcher:
             return self._best_available_payload(event)
 
     def build_event_payload(self, event_id: str, obs: Any = None, img_fallback: Any = None, pre_payload: Optional[dict] = None) -> dict:
+        event = self.repository.event(event_id) if self.repository else None
+        if event and event.get('status') == 'DUPLICATE':
+            raise ValueError('Duplicate event cannot produce an upload payload')
+        store = OutgoingPreview(self.snapshots.root) if self.snapshots and hasattr(self.snapshots, 'root') else None
+        if store:
+            saved = store.load(event_id)
+            if saved is not None:
+                event = self.repository.event(event_id) if self.repository else None
+                if event and event.get('status') != 'CONFIRMED' and not getattr(self.settings, 'local_test_mode', False):
+                    raise ValueError('Saved proof identity requires review before upload')
+                return saved
+        payload = self._build_current_event_payload(event_id, obs, img_fallback, pre_payload)
+        if store and getattr(self.settings, 'local_test_mode', False):
+            event = self.repository.event(event_id) if self.repository else None
+            if not event or event.get('status') != 'CONFIRMED':
+                raise ValueError('Proof preview is waiting for a confirmed event; nothing was frozen or sent')
+            return store.freeze(event_id, payload)
+        return payload
+
+    def _build_current_event_payload(self, event_id: str, obs: Any = None, img_fallback: Any = None, pre_payload: Optional[dict] = None) -> dict:
         """
         Constructs the Prosper Gate Event payload.
         Ensures both Container 1 (Front) and Container 2 (Rear in twin events)

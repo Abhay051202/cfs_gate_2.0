@@ -39,6 +39,8 @@ def create_app(settings=None, database=None, camera_configs=None, runtime_factor
         configs = camera_configs if camera_configs is not None else settings.cameras()
         sources = camera_sources if camera_sources is not None else settings.camera_sources(configs)
         repository = GateRepository(db)
+        repository.strict_ocr_acceptance = settings.strict_ocr_acceptance
+        repository.same_container_event_window_seconds = settings.same_container_event_window_seconds
         snapshots = SnapshotManager(settings.snapshot_directory, categorized=settings.categorized_snapshot_folders)
         # Expose the evidence root for legacy filesystem-only snapshot
         # recovery in the repository/API layer.

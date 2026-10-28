@@ -17,6 +17,8 @@ htmlcov/
 
 # --- Virtual Environments ---
 .venv/
+.local-vendor/
+.local-tests*/
 venv/
 env/
 ENV/

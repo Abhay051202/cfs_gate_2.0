@@ -112,6 +112,8 @@ def datetime_diff_seconds(dt1: datetime | None, dt2: datetime | None) -> float:
 class GateRepository:
     def __init__(self, db):
         self.db = db
+        self.strict_ocr_acceptance = False
+        self.same_container_event_window_seconds = 600.0
         self._write_lock = Lock()
 
     @staticmethod
@@ -329,6 +331,15 @@ class GateRepository:
                         else:
                             matched_existing = None
 
+                recovered = self._recent_text_reread(session, passage, numbers)
+                if recovered and not matched_existing:
+                    session.add(SystemLog(id=str(uuid4()), event_id=recovered.id, level='INFO',
+                        event_name='background_container_reread_suppressed',
+                        context={'source_passage_id': passage.id, 'source_visit_id': passage.visit_id,
+                                 'identities': numbers}))
+                    # Do not replace the original proof with the later distant view.
+                    return recovered.id
+
                 if not matched_existing and numbers:
                     cand_num = numbers[0].strip().upper()
                     n_iso = (best[0].size_type or '').strip().upper() if best else ''
@@ -336,6 +347,9 @@ class GateRepository:
                     recent_events = session.execute(
                         select(GateEvent).where(
                             GateEvent.lane_id == passage.lane_id,
+                            GateEvent.gate_id == passage.gate_id,
+                            GateEvent.event_type == passage.direction,
+                            GateEvent.status != 'DUPLICATE',
                             GateEvent.id != passage.id,
                             GateEvent.timestamp >= passage.started - delta,
                             GateEvent.timestamp <= passage.started + delta
@@ -344,7 +358,7 @@ class GateRepository:
                     for ev in recent_events:
                         c_num = (ev.container_number or '').strip().upper()
                         c_num2 = (ev.container_number_2 or '').strip().upper()
-                        if self._same_container_id(c_num, cand_num) or self._same_container_id(c_num2, cand_num):
+                        if not passage.chassis_observed and cand_num in (c_num, c_num2):
                             matched_existing = ev
                             break
                         c_iso = (ev.iso_code_1 or '').strip().upper()
@@ -628,6 +642,10 @@ class GateRepository:
                             continue
                         cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*_frame.png'))
                         if not cam_frames:
+                            cam_frames = sorted(visit_dir.glob(f'{matched_cam}_context_*.jpg'))
+                        if not cam_frames:
+                            cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*proof*.jpg'))
+                        if not cam_frames:
                             continue
                         chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
                         snap_id = str(uuid4())
@@ -664,7 +682,41 @@ class GateRepository:
                 for path in created: snapshots.remove(path)
             raise
 
+    def enforce_ocr_acceptance(self, event_id):
+        if not self.strict_ocr_acceptance:
+            return
+        event = self.event(event_id)
+        if event and event.get('ocr_acceptance', {}).get('accepted') is False:
+            with self._write_lock, self.db.sessions.begin() as session:
+                row = session.get(GateEvent, event_id)
+                if row and row.status != 'DUPLICATE' and not row.cloud_synced and row.container_number:
+                    row.status = 'NEEDS_REVIEW'
+
+    def _recent_text_reread(self, session, passage, numbers):
+        if not numbers or passage.body_observed or passage.chassis_observed:
+            return None
+        window = timedelta(seconds=self.same_container_event_window_seconds)
+        candidates = session.scalars(select(GateEvent).where(
+            GateEvent.gate_id == passage.gate_id,
+            GateEvent.lane_id == passage.lane_id,
+            GateEvent.event_type == passage.direction,
+            GateEvent.status != 'DUPLICATE',
+            GateEvent.timestamp <= passage.started,
+            GateEvent.timestamp >= passage.started - window,
+        ).order_by(GateEvent.timestamp.desc())).all()
+        identities = {n.strip().upper() for n in numbers}
+        for event in candidates:
+            known = {n.strip().upper() for n in (event.container_number, event.container_number_2) if n}
+            if identities == known:
+                return event
+        return None
+
     def save_passage(self, passage, snapshots, confirmations):
+        event_id = self._save_passage_current(passage, snapshots, confirmations)
+        self.enforce_ocr_acceptance(event_id)
+        return event_id
+
+    def _save_passage_current(self, passage, snapshots, confirmations):
         if passage.final_evidence:
             return self._save_final_passage(passage,snapshots,confirmations)
         """Commit one completed truck, including independently voted identities.
@@ -777,6 +829,14 @@ class GateRepository:
                 current.configuration = camera.model_dump(mode='json')
 
     def save_observation(self, obs: Observation, snapshots, dedup_seconds: float,
+                         additional_frames: dict | None = None, ongoing_event_id=None,
+                         same_container_window_seconds: float = 900):
+        result = self._save_observation_current(obs, snapshots, dedup_seconds,
+            additional_frames, ongoing_event_id, same_container_window_seconds)
+        self.enforce_ocr_acceptance(result[0])
+        return result
+
+    def _save_observation_current(self, obs: Observation, snapshots, dedup_seconds: float,
                          additional_frames: dict | None = None, ongoing_event_id=None,
                          same_container_window_seconds: float = 900):
         """One writer per service; DB uniqueness also protects retried track writes."""
@@ -1325,6 +1385,11 @@ class GateRepository:
                     func.lower(DetectionRecord.class_name) == 'feet'
                 )) is not None
                 review_feedback(item, [serialize(o) for o in session.scalars(select(OCRResult).join(DetectionRecord).where(DetectionRecord.event_id == item['id']))])
+                if self.strict_ocr_acceptance:
+                    detail = self.event(item['id'])
+                    for field in ('status', 'review_reason', 'ocr_acceptance', 'container_number', 'candidate_number'):
+                        if field in detail:
+                            item[field] = detail[field]
                 ocr_texts = session.scalars(select(OCRResult.normalized_text).join(DetectionRecord).where(
                     DetectionRecord.event_id == item['id']
                 )).all()
@@ -1369,6 +1434,16 @@ class GateRepository:
             result['ocr_results'] = [serialize(o) for o in session.scalars(select(OCRResult).where(
                 OCRResult.detection_id.in_([d.id for d in detections])))]
             review_feedback(result, result['ocr_results'])
+            if row.status == 'DUPLICATE':
+                result['status'] = 'DUPLICATE'
+            if self.strict_ocr_acceptance and row.status != 'DUPLICATE' and result.get('container_number'):
+                from app.ocr.acceptance import assess_identity
+                result['ocr_acceptance'] = assess_identity(result)
+                if not result['ocr_acceptance']['accepted']:
+                    result['status'] = 'NEEDS_REVIEW'
+                    result['review_reason'] = result['ocr_acceptance']['reason']
+                    result['candidate_number'] = result['container_number']
+                    result['container_number'] = None
             snapshots_list = [serialize(s) for s in session.scalars(select(Snapshot).where(Snapshot.event_id == event_id))]
             if not snapshots_list:
                 # Recover legacy/event files written before snapshot metadata
@@ -1623,12 +1698,9 @@ class GateRepository:
             primary = session.get(GateEvent, primary_id)
             if not duplicate or not primary or duplicate.id == primary.id:
                 return False
-            session.execute(update(DetectionRecord).where(DetectionRecord.event_id == duplicate.id).values(event_id=primary.id))
-            session.execute(update(Snapshot).where(Snapshot.event_id == duplicate.id).values(event_id=primary.id))
-            session.execute(update(SystemLog).where(SystemLog.event_id == duplicate.id).values(event_id=primary.id))
             duplicate.status = 'DUPLICATE'
-            duplicate.cloud_synced = True
-            duplicate.cloud_synced_at = utcnow()
+            session.add(SystemLog(id=str(uuid4()), event_id=duplicate.id, level='INFO',
+                event_name='duplicate_event_linked', context={'primary_event_id': primary.id}))
             return True
 
     def retain_camera_proof(self, event_id, camera_id, timestamp, snapshots):
@@ -1664,6 +1736,7 @@ class GateRepository:
     def get_unsynced_confirmed_events(self, limit: int = 50, include_unreadable: bool = False):
         with self.db.sessions() as session:
             conds = [
+                GateEvent.status != 'DUPLICATE',
                 (GateEvent.cloud_synced == False) | (GateEvent.cloud_synced.is_(None))
             ]
             if include_unreadable:
@@ -1688,6 +1761,7 @@ class GateRepository:
             query = (
                 select(func.count(GateEvent.id))
                 .where(
+                    GateEvent.status != 'DUPLICATE',
                     (GateEvent.status == 'CONFIRMED') | GateEvent.capture_policy.in_(['BEST_AVAILABLE','FINAL_CAPTURE','UNREADABLE_CAPTURE']),
                     (GateEvent.cloud_synced == False) | (GateEvent.cloud_synced.is_(None))
                 )

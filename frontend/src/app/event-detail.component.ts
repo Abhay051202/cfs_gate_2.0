@@ -113,6 +113,16 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
         }
 
         <!-- Cloud Dispatch Review & Action Banner -->
+        @if (item.local_test_mode) {
+          <div class="review-explanation" role="status">
+            <strong>LOCAL TEST · Cloud uploads blocked</strong>
+            <p>Review the exact images prepared for upload below. Camera synchronization and the axle trigger are not yet validated.</p>
+            @if (item.proof_frozen) {
+              <p>Proof saved locally and frozen. Refreshing this page will not select different images.</p>
+              <a [href]="'/api/gate-events/' + item.id + '/upload-preview'" target="_blank" rel="noopener">View saved upload payload</a>
+            }
+          </div>
+        }
         <div class="cloud-dispatch-banner" [class.synced]="item.cloud_synced" [class.paused]="!item.cloud_synced">
           <div class="cloud-banner-left">
             @if (item.cloud_synced) {
@@ -184,6 +194,7 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
                 <h3>OCR Recognition Evidence</h3>
                 <span class="badge">{{ item.ocr_results.length }} readings</span>
               </div>
+              <p class="image-refresh-note">Engine confidence is a recognition score, not a measured accuracy percentage. Automatic acceptance requires matching source evidence.</p>
               @if (item.ocr_results.length) {
                 <div class="ocr-cards-list">
                   @for (ocr of item.ocr_results; track ocr.id) {
@@ -246,10 +257,10 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
           <div class="evidence-right">
             <div class="panel-card">
               <div class="panel-card-title">
-                <h3>Cloud upload proof</h3>
+                <h3>{{ item.local_test_mode ? 'Local preview · images prepared for upload' : 'Cloud upload proof' }}</h3>
                 <span class="badge">{{ item.cloud_proof_images?.length || 0 }} images</span>
               </div>
-              <p class="image-refresh-note">Exact images selected by the cloud upload builder. Preview only; no data is sent.</p>
+              <p class="image-refresh-note">{{ item.proof_frozen ? 'Frozen images from the saved upload payload. No data has been sent during this local test.' : 'Images selected by the upload builder. Preview only; no data is sent by viewing this page.' }}</p>
               @for (coverage of item.cloud_proof_coverage || []; track $index) {
                 @if (coverage.required > 0) {
                   <p class="image-refresh-note" [class.review-explanation]="!coverage.complete">

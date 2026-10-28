@@ -89,6 +89,8 @@ class CloudProofUpgrader:
 
     def start(self):
         """Start the background upgrade worker thread."""
+        if getattr(self.settings, 'local_test_mode', False) is True:
+            return
         with self._lock:
             if self._worker_thread and self._worker_thread.is_alive():
                 return
@@ -175,6 +177,8 @@ class CloudProofUpgrader:
         """
         if not self.repository:
             return {'success': False, 'status': 'NO_REPOSITORY'}
+        if getattr(self.settings, 'local_test_mode', False) is True:
+            return {'success': False, 'status': 'LOCAL_ONLY'}
 
         event_record = self.repository.event(event_id)
         if not event_record:
