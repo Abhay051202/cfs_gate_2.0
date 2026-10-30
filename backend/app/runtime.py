@@ -1215,10 +1215,15 @@ class GateRuntime:
                 early = self.settings.vehicle_visit_tracking and complete and coverage
                 if self.settings.strict_ocr_acceptance:
                     early = False  # Keep observing other cameras through departure.
-                departed = all(p.closed and (not self.settings.vehicle_visit_tracking or p.closed_at is None or
-                    (utcnow()-p.closed_at).total_seconds()>=self.settings.reversal_grace_seconds) and
-                    all(not r.pending and (not r.candidates or r.confirmed(self.settings.ocr_confirmations))
-                        for r in p.regions) for p in group)
+                is_live_rtsp = any(getattr(p, 'source_type', 'file') == 'rtsp' for p in group)
+                wait_sec = min(self.settings.gate_clear_seconds, 3.0) if is_live_rtsp else self.settings.reversal_grace_seconds
+                departed = all(
+                    p.closed and
+                    (not self.settings.vehicle_visit_tracking or p.closed_at is None or
+                     (utcnow() - p.closed_at).total_seconds() >= wait_sec) and
+                    all(not r.pending for r in p.regions)
+                    for p in group
+                )
                 if early or departed:
                     ready.append(group)
         for group in ready:

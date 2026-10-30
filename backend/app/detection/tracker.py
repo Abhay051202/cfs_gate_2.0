@@ -69,7 +69,7 @@ class TemporalTracker:
             (iou(track.detection.bbox, det.bbox), tid, index)
             for tid, track in self.tracks.items() for index, det in enumerate(detections)
             if (track.detection.class_name == det.class_name or
-                {track.detection.class_name, det.class_name} <= {'truck', 'trailer', 'vehicle'})
+                {track.detection.class_name, det.class_name} <= {'truck', 'trailer', 'vehicle', 'container'})
             and (similar(track.appearance, features[index]) or
                  ((timestamp-track.last_seen).total_seconds() <= 1.0
                   and iou(track.detection.bbox, det.bbox) >= .85

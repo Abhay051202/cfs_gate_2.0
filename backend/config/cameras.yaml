@@ -58,7 +58,7 @@ cameras:
     direction: EXIT
     role: REAR
     capture_fps: 10
-    occupancy_roi: [0.26, 0.05, 0.78, 0.96]
+    occupancy_roi: [0.10, 0.03, 0.90, 0.98]
   - id: gate-out-2
     name: Gate OUT 2 (Front/Approach)
     gate_id: lane-out
@@ -66,7 +66,7 @@ cameras:
     direction: EXIT
     role: FRONT_TOP
     capture_fps: 10
-    occupancy_roi: [0.20, 0.05, 0.82, 0.96]
+    occupancy_roi: [0.10, 0.03, 0.90, 0.98]
   - id: gate-out-3
     name: Gate OUT 3 (Rear)
     gate_id: lane-out

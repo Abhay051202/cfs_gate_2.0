@@ -94,6 +94,7 @@ class Passage:
     capture_only: bool = False
     selected_numbers: tuple[str, ...] | None = None
     identity_conflict: bool = False
+    max_cy: float = 0.0
 
 
 class PassageCollector:
@@ -110,6 +111,9 @@ class PassageCollector:
 
     def _is_stationary_background_text(self, camera_id, timestamp, bbox) -> bool:
         """Detect parked background containers whose text bbox has not moved for >= 45s."""
+        # Never classify text as stationary background if there is an active truck/container passage on this camera
+        if any(p.camera_id == camera_id and not p.closed for p in self.active.values()):
+            return False
         hist = self._text_history.get(camera_id, [])
         matching = [ts for ts, old_box in hist if iou(old_box, bbox) >= 0.72]
         if not matching:
@@ -214,7 +218,8 @@ class PassageCollector:
                 bx=track.detection.bbox
                 cx,cy=(bx[0]+bx[2])/(2*w),(bx[1]+bx[3])/(2*h)
                 rx1,ry1,rx2,ry2=camera.occupancy_roi
-                if not (rx1<=cx<=rx2 and ry1<=cy<=ry2) and not any(
+                roi_box = (rx1*w, ry1*h, rx2*w, ry2*h)
+                if not (rx1<=cx<=rx2 and ry1<=cy<=ry2) and iou(bx, roi_box) < 0.10 and not any(
                         contains_text(bx,t.bbox) for t in container_evidence):
                     # A measured vehicle outside the capture ROI cannot keep
                     # the gate visit alive merely by remaining in the image.
@@ -251,7 +256,8 @@ class PassageCollector:
                     bx = track.detection.bbox
                     cx,cy = (bx[0]+bx[2])/(2*w),(bx[1]+bx[3])/(2*h)
                     rx1,ry1,rx2,ry2 = camera.occupancy_roi
-                    if (rx1 <= cx <= rx2 and ry1 <= cy <= ry2) or any(
+                    roi_box = (rx1*w, ry1*h, rx2*w, ry2*h)
+                    if (rx1 <= cx <= rx2 and ry1 <= cy <= ry2) or iou(bx, roi_box) >= 0.10 or any(
                             contains_text(bx,d.bbox) for d in container_evidence):
                         lane = camera.gate_id
                 if lane is None:
@@ -269,7 +275,7 @@ class PassageCollector:
                                                   abs(track.detection.bbox[0]-p.bbox[0]) < .55*frame.image.shape[1]))) or
                        self._number_matches_recent_body(p,track.detection,frame))) or
                      (p.body_observed and track.detection.class_name in ('truck','trailer','vehicle','container')
-                      and 0 <= (frame.timestamp-p.last_seen).total_seconds() <= 2
+                      and 0 <= (frame.timestamp-p.last_seen).total_seconds() <= max(10.0, self.settings.gate_clear_seconds)
                       and iou(p.bbox,track.detection.bbox) >= (.15 if len(tracks) == 1 else .5)
                       and (same_colour(p.appearance,track.appearance) or similar(p.appearance,track.appearance,.75))))]
                 if not same_view and camera.source_type == 'rtsp' and len(tracks) == 1:
@@ -384,6 +390,7 @@ class PassageCollector:
                 passage.reverse_distance = max(0,passage.reverse_distance-delta)
                 passage.reversing = passage.reverse_distance > .05
             passage.last_seen, passage.bbox = frame.timestamp, reference_box
+            passage.max_cy = max(getattr(passage, 'max_cy', 0.0), (reference_box[1] + reference_box[3]) / (2 * frame.image.shape[0]))
             passage.body_observed = measured_body or retained_body
             passage.chassis_observed=passage.chassis_observed or track.detection.class_name in ('truck','trailer','vehicle')
             passage.appearance = passage.last_body_appearance if retained_body else track.appearance
@@ -510,8 +517,10 @@ class PassageCollector:
             if not passage.closed and passage.bbox:
                 by1, by2 = passage.bbox[1], passage.bbox[3]
                 cy = (by1 + by2) / (2 * frame.image.shape[0])
+                passage.max_cy = max(getattr(passage, 'max_cy', 0.0), cy)
+                passage_duration = (frame.timestamp - passage.started).total_seconds()
                 if (camera.direction in ('ENTRY', 'IN') and cy > (camera.occupancy_roi[3] + 0.02)) or \
-                   (camera.direction in ('EXIT', 'OUT') and (cy > 0.95 or cy < 0.05)):
+                   (camera.direction in ('EXIT', 'OUT') and (cy > 0.95 or (cy < 0.05 and getattr(passage, 'max_cy', 0.0) > 0.20 and passage_duration >= 1.5))):
                     passage.closed = True
                     passage.closed_at = frame.timestamp
                     self.active.pop(identity, None)
