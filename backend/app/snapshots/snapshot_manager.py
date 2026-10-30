@@ -221,12 +221,21 @@ class SnapshotManager:
             score = float(item.get('quality_score') or 0.0)
             if item.get('id') in preferred_ids:
                 score += 500.0
-            if '_proof' in (item.get('image_path') or ''):
+            img_path = str(item.get('image_path') or '')
+            if '_proof' in img_path:
                 score += 1500.0
+            elif '_capture_' in img_path:
+                score += 1200.0
+            elif '_context' in img_path:
+                score += 300.0
             for det in (event_record.get('detections') or []):
-                if det.get('camera_id') == item.get('camera_id') and det.get('class_name') == 'container_number':
-                    score += 800.0
-                    break
+                if det.get('camera_id') == item.get('camera_id'):
+                    if det.get('class_name') == 'container_number':
+                        score += 800.0
+                        break
+                    elif det.get('class_name') == 'container':
+                        score += 400.0
+                        break
             try:
                 from app.events.cloud_dispatcher import snapshot_has_identity
                 c1 = event_record.get('container_number')

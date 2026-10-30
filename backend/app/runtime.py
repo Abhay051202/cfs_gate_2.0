@@ -1056,8 +1056,12 @@ class GateRuntime:
         if len(visits)!=1:
             return  # Multiple trucks need ownership; do not mix their context.
         visit = next(iter(visits))
-        owner = next(p for p in active if (p.visit_id or p.id) == visit)
+        owner = next((p for p in active if (p.visit_id or p.id) == visit), None)
+        if owner is None or owner.closed:
+            return
         for observer in self.cameras:
+            if owner.closed:
+                return
             if not observer.enabled or observer.gate_id!=camera.gate_id or observer.direction!=camera.direction:
                 continue
             worker = self.manager.workers.get(observer.id)
@@ -1338,7 +1342,8 @@ class GateRuntime:
     def _finalize_passage_group(self, group, _region_confirmed):
         from dataclasses import replace
         has_confirmed = any(_region_confirmed(r) for p in group for r in p.regions if not r.context_only)
-        if has_confirmed:
+        all_closed = all(p.closed for p in group)
+        if has_confirmed and all_closed:
             for p in group:
                 self.ocr_store.cancel_pending(f'passage:{p.id}:%', p.id)
         elif any(self.ocr_store.passage_pending(p.id) for p in group):

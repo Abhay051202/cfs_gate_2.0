@@ -16,16 +16,19 @@ class VisitCapture:
         live = {p.visit_id or p.id for p in passages if not p.saved}
         self.samples = {k: v for k, v in self.samples.items() if k[0] in live}
         for p in passages:
-            if p.saved or p.closed or p.capture_only or p.camera_id != camera.id or p.source_id != frame.source_id:
+            if p.saved or p.closed or p.camera_id != camera.id or p.source_id != frame.source_id:
                 continue
             if p.last_seen != frame.timestamp:
                 continue
-            visible = any((d.class_name == 'container' and d.confidence >= .35 and iou(d.bbox, p.bbox) >= .1) or
-                (d.class_name == 'container_number' and d.confidence >= .35 and contains_text(p.bbox, d.bbox)
-                 and d.bbox[3]-d.bbox[1] >= frame.image.shape[0]*self.settings.minimum_text_trigger_height_ratio)
+            visible = any((d.class_name == 'container' and d.confidence >= .35 and (iou(d.bbox, p.bbox) >= .1 or p.capture_only)) or
+                (d.class_name == 'container_number' and d.confidence >= .35 and (contains_text(p.bbox, d.bbox) or p.capture_only)
+                 and d.bbox[3]-d.bbox[1] >= frame.image.shape[0]*self.settings.minimum_text_trigger_height_ratio) or
+                (d.class_name in ('truck', 'trailer') and d.confidence >= .40 and (iou(d.bbox, p.bbox) >= .15 or p.capture_only))
                 for d in detections)
             if not visible:
                 continue
+            if p.capture_only:
+                p.body_observed = True
             visit, key = p.visit_id or p.id, (p.visit_id or p.id, camera.id)
             previous = self.samples.get(key)
             if previous and (frame.timestamp-previous['timestamp']).total_seconds() < self.settings.visit_capture_interval_seconds:
@@ -47,8 +50,11 @@ class VisitCapture:
             temporary = path.with_suffix('.jpg.tmp')
             temporary.write_bytes(data.tobytes())
             temporary.replace(path)
+            cntr_boxes = [d.bbox for d in detections if d.class_name in ('container', 'container_number')]
+            best_target = max(cntr_boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1])) if cntr_boxes else p.bbox
             atomic_json(path.with_suffix('.json'), {'visit_id': visit, 'camera_id': camera.id,
                 'captured_at': frame.timestamp.isoformat()+'Z', 'source_id': frame.source_id,
-                'sequence': frame.sequence, 'target_bbox': list(p.bbox), 'quality': quality})
+                'sequence': frame.sequence, 'target_bbox': list(best_target), 'quality': quality,
+                'has_container': bool(cntr_boxes)})
             self.samples[key] = {'timestamp': frame.timestamp, 'bbox': p.bbox, 'quality': quality,
                 'slot': slot, 'count': (previous['count']+1 if previous else 1)}

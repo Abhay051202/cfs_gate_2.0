@@ -109,6 +109,72 @@ def datetime_diff_seconds(dt1: datetime | None, dt2: datetime | None) -> float:
     return abs((t1 - t2).total_seconds())
 
 
+def _select_best_companion_frame(visit_dir, camera_id, anchor_timestamp):
+    """
+    Select the optimal synchronized companion frame that actually shows the container.
+    Prioritizes verified capture_*.jpg frames over rolling context_*.jpg,
+    scoring by verified container presence, quality, and time alignment to anchor_timestamp.
+    """
+    captures = sorted(visit_dir.glob(f'{camera_id}_capture_*.jpg'))
+    if captures:
+        best_cap, best_score = None, -999999.0
+        for cap in captures:
+            meta_file = cap.with_suffix('.json')
+            quality, dt = 5.0, None
+            has_container = True
+            if meta_file.is_file():
+                try:
+                    import json
+                    meta = json.loads(meta_file.read_text(encoding='utf-8'))
+                    quality = float(meta.get('quality', 5.0))
+                    has_container = bool(meta.get('has_container', True))
+                    ts_str = meta.get('captured_at', '')
+                    if ts_str:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                except Exception:
+                    pass
+            drift = abs((dt - anchor_timestamp).total_seconds()) if (dt and anchor_timestamp) else 0.0
+            score = quality + (2000.0 if has_container else 0.0) - (drift * 50.0)
+            if score > best_score:
+                best_score = score
+                best_cap = cap
+        if best_cap:
+            return best_cap
+
+    cam_frames = sorted(visit_dir.glob(f'{camera_id}_*_frame.png'))
+    if cam_frames:
+        return max(cam_frames, key=lambda f: f.stat().st_size)
+
+    ctx_frames = sorted(visit_dir.glob(f'{camera_id}_context_*.jpg'))
+    if ctx_frames:
+        valid_ctx = []
+        for ctx in ctx_frames:
+            meta_file = ctx.with_suffix('.json')
+            dt = None
+            if meta_file.is_file():
+                try:
+                    import json
+                    meta = json.loads(meta_file.read_text(encoding='utf-8'))
+                    ts_str = meta.get('captured_at', '')
+                    if ts_str:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                except Exception:
+                    pass
+            if dt and anchor_timestamp:
+                drift = abs((dt - anchor_timestamp).total_seconds())
+                if drift <= 6.0:
+                    valid_ctx.append((drift, ctx))
+            else:
+                valid_ctx.append((999.0, ctx))
+        if valid_ctx:
+            valid_ctx.sort(key=lambda x: x[0])
+            return valid_ctx[0][1]
+
+    return None
+
+
 class GateRepository:
     def __init__(self, db):
         self.db = db
@@ -455,14 +521,10 @@ class GateRepository:
                         for matched_cam in sorted(valid_cameras):
                             if matched_cam in existing_snaps:
                                 continue
-                            cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*_frame.png'))
-                            if not cam_frames:
+                            anchor_dt = existing.timestamp if hasattr(existing.timestamp, 'timestamp') else None
+                            chosen_file = _select_best_companion_frame(visit_dir, matched_cam, anchor_dt)
+                            if not chosen_file:
                                 continue
-                            ctx_frames = sorted(visit_dir.glob(f'{matched_cam}_context_*.jpg')) + sorted(visit_dir.glob(f'{matched_cam}_capture_*.jpg'))
-                            if ctx_frames:
-                                chosen_file = max(ctx_frames, key=lambda f: f.stat().st_mtime)
-                            else:
-                                chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
                             snap_id = str(uuid4())
                             det_id = str(uuid4())
                             durable_name = f'{matched_cam}_{snap_id}_context.jpg'
@@ -619,18 +681,10 @@ class GateRepository:
                     for matched_cam in sorted(valid_cameras):
                         if matched_cam in saved_snaps:
                             continue
-                        cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*_frame.png'))
-                        ctx_frames = sorted(visit_dir.glob(f'{matched_cam}_context_*.jpg')) + sorted(visit_dir.glob(f'{matched_cam}_capture_*.jpg'))
-                        if cam_frames and ctx_frames:
-                            chosen_file = max(ctx_frames, key=lambda f: f.stat().st_mtime)
-                        else:
-                            if not cam_frames:
-                                cam_frames = ctx_frames
-                            if not cam_frames:
-                                cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*proof*.jpg'))
-                            if not cam_frames:
-                                continue
-                            chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
+                        anchor_dt = passage.started if hasattr(passage.started, 'timestamp') else None
+                        chosen_file = _select_best_companion_frame(visit_dir, matched_cam, anchor_dt)
+                        if not chosen_file:
+                            continue
                         snap_id = str(uuid4())
                         det_id = str(uuid4())
                         durable_name = f'{matched_cam}_{snap_id}_context.jpg'
