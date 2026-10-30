@@ -239,7 +239,7 @@ class GateRepository:
             v_num = val_num.strip().upper()
             if len(v_num) != 11: return 1.0
             q = 10.0
-            from app.ocr.validator import check_digit, STRUCTURE
+            from app.ocr.validator import check_digit, STRUCTURE, STANDARD_BIC_PREFIXES
             if v_num[3] == 'U':
                 q += 150.0
             if STRUCTURE.fullmatch(v_num):
@@ -249,12 +249,12 @@ class GateRepository:
                         q += 500.0
                 except Exception:
                     pass
-            if v_num.startswith(('ONEU','MSKU','MEDU','MAEU','CMAU','TCNU','TGHU','TRHU','WHSU','SPSU','KKTU','TEMU','TIIU','CAIU','TLLU','FDCU','JFSU','MRSU','MSMU','MSNU','HASU','DPWU','WHLU','SEGU','GLDU','BMOU','HAMU')):
+            if v_num[:4] in STANDARD_BIC_PREFIXES or v_num.startswith(('ONEU','MSKU','MEDU','MAEU','CMAU','TCNU','TGHU','TRHU','WHSU','SPSU','KKTU','TEMU','TIIU','CAIU','TLLU','FDCU','JFSU','MRSU','MSMU','MSNU','HASU','DPWU','WHLU','SEGU','GLDU','BMOU','HAMU')):
                 q += 100.0
             if val_obj:
                 q += float(getattr(val_obj, 'confidence', 0.0)) * 50.0
                 if getattr(val_obj, 'size_type', None):
-                    q += 40.0
+                    q += 100.0
             return q
 
         entries = {}
@@ -367,12 +367,10 @@ class GateRepository:
         created = []
         try:
             with self._write_lock,self.db.sessions.begin() as session:
-                if session.get(GateEvent,passage.id):
-                    return passage.id
-                best = [max(entries[n]['proofs'].values(),key=lambda p:p[0].confidence)[0] for n in numbers]
-                matched_existing = None
+                matched_existing = session.get(GateEvent, passage.id)
                 pair_as_twin = False
-                if visit_id and numbers:
+                best = [max(entries[n]['proofs'].values(), key=lambda p: p[0].confidence)[0] for n in numbers] if numbers else []
+                if not matched_existing and visit_id and numbers:
                     candidates = session.scalars(select(GateEvent).where(
                         GateEvent.visit_id == visit_id,
                         GateEvent.id != passage.id,
@@ -441,7 +439,7 @@ class GateRepository:
                                 self.confidence = c
                                 self.size_type = st
                         existing_obj = _TmpObj(existing_best_conf, existing.iso_code_1)
-                        if passage.selected_numbers is None and _quality(numbers[0], best[0]) > _quality(existing.container_number, existing_obj):
+                        if _quality(numbers[0], best[0]) > _quality(existing.container_number, existing_obj):
                             old_cnum = existing.container_number
                             existing.container_number = numbers[0]
                             if best[0].size_type:
@@ -456,6 +454,9 @@ class GateRepository:
                                     ocr_row.valid_format = True
                                     ocr_row.valid_check_digit = True
                                     ocr_row.validation_status = 'VALID'
+                        elif numbers[0] == existing.container_number and best and best[0].size_type and not existing.iso_code_1:
+                            existing.iso_code_1 = best[0].size_type
+                            existing.cloud_synced = False
                     existing_snap_rows = session.execute(
                         select(Snapshot).where(Snapshot.event_id == existing.id)
                     ).scalars().all()
@@ -473,7 +474,7 @@ class GateRepository:
                             should_add_proof = pair_as_twin or (camera_id not in existing_proof_cams)
                             if not should_add_proof:
                                 cam_snaps = [s for s in existing_snap_rows if s.camera_id == camera_id and '_proof' in (s.image_path or '')]
-                                if all(abs((s.timestamp - job.frame.timestamp).total_seconds()) > 0.5 for s in cam_snaps):
+                                if cam_snaps:
                                     try:
                                         import cv2, numpy as np
                                         new_q = float(snapshots.compute_quality(job.frame.image))
@@ -484,7 +485,7 @@ class GateRepository:
                                                 dec = cv2.imdecode(np.frombuffer(sp.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
                                                 if dec is not None:
                                                     old_best_q = max(old_best_q, float(snapshots.compute_quality(dec)))
-                                        if new_q > old_best_q * 1.15:
+                                        if new_q > old_best_q * 1.10:
                                             should_add_proof = True
                                     except Exception:
                                         pass

@@ -103,6 +103,7 @@ class GateRuntime:
         self.ocr_spool_error = None
         self._capture_folders = set()
         self._finalization_failures = {}
+        self._early_finalized_visits = {}
         self._gate_context_samples = {}
         from app.snapshots.overview import VisitOverview
         self.overviews = VisitOverview(settings, snapshots)
@@ -1205,16 +1206,6 @@ class GateRuntime:
                             number_cameras.setdefault(number,set()).update(proofs)
                 min_cameras = int(getattr(self.settings, 'minimum_number_proof_cameras', 1) or 1)
                 coverage = bool(number_cameras) and all(len(cams)>=min_cameras for cams in number_cameras.values())
-                if confirmed_regions and not self.settings.strict_ocr_acceptance:
-                    for p in group:
-                        p_confirmed = any(_region_confirmed(r) for r in p.regions if not r.context_only)
-                        if p_confirmed or p.closed:
-                            for r in p.regions:
-                                r.candidates.clear()
-                                r.pending = 0
-                early = self.settings.vehicle_visit_tracking and complete and coverage
-                if self.settings.strict_ocr_acceptance:
-                    early = False  # Keep observing other cameras through departure.
                 is_live_rtsp = any(getattr(p, 'source_type', 'file') == 'rtsp' for p in group)
                 wait_sec = min(self.settings.gate_clear_seconds, 3.0) if is_live_rtsp else self.settings.reversal_grace_seconds
                 departed = all(
@@ -1224,15 +1215,40 @@ class GateRuntime:
                     all(not r.pending for r in p.regions)
                     for p in group
                 )
-                if early or departed:
-                    ready.append(group)
-        for group in ready:
+                full_lane_coverage = bool(number_cameras) and all(
+                    expected.issubset(cams) or len(cams) >= len(expected)
+                    for cams in number_cameras.values()
+                )
+                if confirmed_regions and (all(p.closed for p in group) or full_lane_coverage):
+                    for p in group:
+                        for r in p.regions:
+                            r.candidates.clear()
+                            r.pending = 0
+                early = self.settings.vehicle_visit_tracking and complete and coverage
+                if self.settings.strict_ocr_acceptance:
+                    early = False
+                visit_key = min(p.visit_id or p.id for p in group)
+                confirmed_cams = {p.camera_id for p in group if any(_region_confirmed(r) for r in p.regions if not r.context_only)}
+                if departed:
+                    ready.append((group, 'departed'))
+                elif early:
+                    if full_lane_coverage:
+                        ready.append((group, 'departed'))
+                    elif visit_key not in self._early_finalized_visits:
+                        ready.append((group, 'early'))
+                    elif confirmed_cams - self._early_finalized_visits.get(visit_key, set()):
+                        ready.append((group, 'update'))
+        for item in ready:
+            if isinstance(item, tuple):
+                group, mode = item
+            else:
+                group, mode = item, 'departed'
             key = min(p.visit_id or p.id for p in group)
             failure = self._finalization_failures.get(key)
             if failure and (failure['attempts'] >= 3 or time.monotonic() < failure['retry_at']):
                 continue
             try:
-                self._finalize_passage_group(group, _region_confirmed)
+                self._finalize_passage_group(group, _region_confirmed, mode=mode)
                 self._finalization_failures.pop(key, None)
             except Exception as exc:
                 attempts = (failure or {}).get('attempts', 0) + 1
@@ -1355,14 +1371,14 @@ class GateRuntime:
                 self.passages.result(p.id, reg.id, matched_val, job)
                 break
 
-    def _finalize_passage_group(self, group, _region_confirmed):
+    def _finalize_passage_group(self, group, _region_confirmed, mode='departed'):
         from dataclasses import replace
         has_confirmed = any(_region_confirmed(r) for p in group for r in p.regions if not r.context_only)
         all_closed = all(p.closed for p in group)
-        if has_confirmed and all_closed:
+        if mode == 'departed' and has_confirmed and all_closed:
             for p in group:
                 self.ocr_store.cancel_pending(f'passage:{p.id}:%', p.id)
-        elif any(self.ocr_store.passage_pending(p.id) for p in group):
+        elif mode == 'departed' and any(self.ocr_store.passage_pending(p.id) for p in group):
             return
         if self.settings.vehicle_visit_tracking:
             from app.events.passages import final_captures
@@ -1373,7 +1389,7 @@ class GateRuntime:
                     p.visit_id = visit_id
             else:
                 visit_id = min(group,key=lambda p:(p.started,p.id)).visit_id or group[0].id
-            if any(getattr(p, 'source_type', 'file') == 'rtsp' for p in group):
+            if (mode == 'departed' or any(p.closed for p in group)) and any(getattr(p, 'source_type', 'file') == 'rtsp' for p in group):
                 self._recover_from_visit_context_files(group, visit_id, _region_confirmed)
                 has_confirmed = any(_region_confirmed(r) for p in group for r in p.regions if not r.context_only)
             plans = final_captures(group,self.settings.ocr_confirmations)
@@ -1433,11 +1449,11 @@ class GateRuntime:
                     self.ocr_store.retain_origin_proof(job.origin_key,job.frame.sequence)
                 saved_ev = self.repository.event(event_id)
                 if not saved_ev or not saved_ev.get('cloud_synced'):
-                    grace = 0.0 if has_confirmed else float(getattr(self.settings, 'cloud_dispatch_grace_seconds', 5.0) or 5.0)
+                    grace = 0.0 if (mode == 'departed' and has_confirmed) else float(getattr(self.settings, 'cloud_dispatch_grace_seconds', 5.0) or 5.0)
                     self.dispatcher.enqueue(None,event_id,delay_seconds=grace)
                 elif hasattr(self, 'proof_upgrader') and self.proof_upgrader:
                     self.proof_upgrader.enqueue_upgrade(event_id)
-                if not is_repeat_confirmation and plan.direction in ('EXIT', 'OUT', 'GATE_OUT'):
+                if mode == 'early' and not is_repeat_confirmation and plan.direction in ('EXIT', 'OUT', 'GATE_OUT'):
                     try:
                         cntr = (saved_ev or {}).get('container_number')
                         self.emit_alert(
@@ -1451,6 +1467,20 @@ class GateRuntime:
                         )
                     except Exception:
                         pass
+            expected = {c.id for c in self.cameras if c.enabled and c.gate_id == group[0].gate_id}
+            number_cameras = {}
+            for p in group:
+                for region in p.regions:
+                    for number, proofs in region.source_proofs.items():
+                        number_cameras.setdefault(number, set()).update(proofs)
+            full_lane_coverage = bool(number_cameras) and all(
+                expected.issubset(cams) or len(cams) >= len(expected)
+                for cams in number_cameras.values()
+            )
+            if mode in ('early', 'update') and not full_lane_coverage:
+                confirmed_cams = {p.camera_id for p in group if any(_region_confirmed(r) for r in p.regions if not r.context_only)}
+                self._early_finalized_visits[visit_id] = confirmed_cams
+                return
             for p in group:
                 for region in p.regions:
                     if region.id not in retained:
@@ -1463,6 +1493,7 @@ class GateRuntime:
                     wdir = self.snapshots.path(f'waiting/{folder_key}')
                     if wdir.is_dir():
                         shutil.rmtree(wdir, ignore_errors=True)
+            self._early_finalized_visits.pop(visit_id, None)
             with self._state_lock:
                 for p in group:
                     p.saved = True

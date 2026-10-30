@@ -317,7 +317,7 @@ class SnapshotManager:
 
         # Resolve rear proof snapshot
         is_twin = bool(event_record.get('is_twin'))
-        rear_cands = [c for c in captures if (c.get('image_path') or '').endswith('_rear.jpg') or any(k in (c.get('camera_id') or '').lower() for k in ('-3', 'rear'))]
+        rear_cands = [c for c in captures if (c.get('image_path') or '').endswith('_rear.jpg') or any(k in (c.get('camera_id') or '').lower() for k in ('-3', 'rear', 'gate-in-1', 'gate-out-1', '-1'))]
         if event_record.get('rear_snapshot_id') in ids:
             rear = event_record.get('rear_snapshot_id')
         elif rear_cands:
