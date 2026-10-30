@@ -207,8 +207,6 @@ class GateRepository:
         from app.ocr.validator import check_digit, STRUCTURE
         has_check_a = bool(len(a) == 11 and STRUCTURE.fullmatch(a) and check_digit(a[:10]) == int(a[10]))
         has_check_b = bool(len(b) == 11 and STRUCTURE.fullmatch(b) and check_digit(b[:10]) == int(b[10]))
-        if has_check_a and has_check_b and a != b:
-            return False
         if len(a) == 11 and len(b) == 11:
             if a[4:10] == b[4:10]:
                 return True
@@ -217,7 +215,7 @@ class GateRepository:
                     return True
                 if cls._levenshtein(a[4:10], b[4:10]) <= 1 or cls._levenshtein(a[4:11], b[4:11]) <= 2:
                     return True
-                if cls._levenshtein(a, b) <= 3:
+                if cls._levenshtein(a, b) <= 2:
                     return True
             if sum(x == y for x, y in zip(a[:4], b[:4])) >= 3:
                 if cls._levenshtein(a[4:10], b[4:10]) <= 1 or cls._levenshtein(a[4:11], b[4:11]) <= 2:
@@ -226,6 +224,8 @@ class GateRepository:
                 return True
             if a[5:10] == b[5:10] or a[6:10] == b[5:9] or a[5:9] == b[6:10]:
                 return True
+        if has_check_a and has_check_b and a != b:
+            return False
         return False
 
     def _save_final_passage(self, passage, snapshots, confirmations):
@@ -378,7 +378,7 @@ class GateRepository:
                         GateEvent.status != 'DUPLICATE')).all()
                     for candidate in candidates:
                         known = {n for n in (candidate.container_number, candidate.container_number_2) if n}
-                        if known == set(numbers):
+                        if known == set(numbers) or (len(numbers) == 1 and len(known) == 1 and self._same_container_id(numbers[0], next(iter(known)))):
                             matched_existing = candidate
                             break
 

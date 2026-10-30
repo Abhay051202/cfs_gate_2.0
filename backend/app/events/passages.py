@@ -324,7 +324,7 @@ class PassageCollector:
                         if (other.camera_id != camera.id and other.gate_id == camera.gate_id
                                 and other.lane_id == lane and other.direction == camera.direction
                                 and other.source_type == camera.source_type == 'rtsp'
-                                and not other.closed and not other.saved
+                                and not other.closed
                                 and abs((frame.timestamp-other.started).total_seconds()) <= self.settings.cross_camera_arrival_window_seconds
                                 and abs((frame.timestamp-other.last_seen).total_seconds()) <= self.settings.cross_camera_view_window_seconds):
                             visit = other.visit_id or other.id
@@ -349,11 +349,15 @@ class PassageCollector:
                 # has replaced it on the same tracker ID (large time gap or complete spatial/visual separation).
                 gap_sec = (frame.timestamp - passage.last_seen).total_seconds() if passage.last_seen else 0.0
                 split_gap = max(5.0, self.settings.gate_clear_seconds) if camera.source_type == 'rtsp' else 1.5
-                min_iou = 0.05 if camera.source_type == 'rtsp' else 0.45
-                min_sim = 0.55 if camera.source_type == 'rtsp' else 0.85
-                if (gap_sec > split_gap or (iou(passage.bbox, track.detection.bbox) < min_iou and
-                        (passage.appearance is not None and track.appearance is not None and
-                         not similar(passage.appearance, track.appearance, min_sim)))):
+                should_split = gap_sec > split_gap
+                if camera.source_type != 'rtsp':
+                    min_iou = 0.45
+                    min_sim = 0.85
+                    if (iou(passage.bbox, track.detection.bbox) < min_iou and
+                            (passage.appearance is not None and track.appearance is not None and
+                             not similar(passage.appearance, track.appearance, min_sim))):
+                        should_split = True
+                if should_split:
                     passage.closed = True
                     passage.closed_at = frame.timestamp
                     lane = passage.lane_id
@@ -663,7 +667,10 @@ class PassageCollector:
                     # OCR confidence. Agreement across independent cameras is
                     # evidence too; do not require two reads in each camera.
                     overlap = max(passage.started,other.started) <= min(passage.last_seen,other.last_seen) + timedelta(seconds=self.settings.cross_camera_view_window_seconds)
-                    same_identity = bool(identities & other_numbers) and overlap
+                    from app.database.repositories.gate import GateRepository
+                    same_identity = (bool(identities & other_numbers) or any(
+                        GateRepository._same_container_id(i1, i2) for i1 in identities for i2 in other_numbers
+                    )) and overlap
                     start_gap = abs((passage.started - other.started).total_seconds())
                     cross_view_window = start_gap <= self.settings.cross_camera_arrival_window_seconds
                     if (passage.camera_id == other.camera_id and passage.source_id == other.source_id

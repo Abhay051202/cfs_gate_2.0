@@ -42,6 +42,25 @@ def plan_captures(group, confirmations):
                  if sum(id(r) == id(other) for records in numbers.values()
                         for _, other, _ in records) > 1}
     reliable_twin = reliable_twin and not conflicts
+    if not reliable_twin and len(numbers) > 1:
+        from app.database.repositories.gate import GateRepository
+        merged = {}
+        for n, records in numbers.items():
+            matched_w = None
+            for w in merged:
+                if GateRepository._same_container_id(n, w):
+                    matched_w = w
+                    break
+            if matched_w:
+                w_votes = sum(c for _, _, c in merged[matched_w])
+                n_votes = sum(c for _, _, c in records)
+                if n_votes > w_votes:
+                    merged[n] = merged.pop(matched_w) + records
+                else:
+                    merged[matched_w].extend(records)
+            else:
+                merged[n] = records
+        numbers = merged
     bundles = [sorted(numbers)] if reliable_twin else [[n] for n in sorted(numbers)]
     base = min(p.visit_id or p.id for p in group)
     plans = []
