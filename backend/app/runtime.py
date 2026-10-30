@@ -1224,7 +1224,8 @@ class GateRuntime:
                     p.camera_id in rear_cams and (
                         any(_region_confirmed(r) for r in p.regions if not r.context_only) or
                         any(r.reads for r in p.regions) or
-                        p.body_observed
+                        p.body_observed or
+                        p.closed
                     )
                     for p in group
                 )
@@ -1506,7 +1507,8 @@ class GateRuntime:
                 p.camera_id in rear_cams and (
                     any(_region_confirmed(r) for r in p.regions if not r.context_only) or
                     any(r.reads for r in p.regions) or
-                    p.body_observed
+                    p.body_observed or
+                    p.closed
                 )
                 for p in group
             )
