@@ -20,7 +20,7 @@ STANDARD_BIC_PREFIXES = frozenset({
     'DFSU', 'FSCU', 'GAOU', 'GLDU', 'INKU', 'LTIU', 'MAGU', 'MSMU', 'MSNU', 'MWCU',
     'NLLU', 'PCIU', 'PIDU', 'RFCU', 'SITU', 'SKLU', 'SLSU', 'SMLU', 'TCKU', 'TGHU',
     'TIIU', 'TINU', 'TKRU', 'TOLU', 'TPHU', 'TRIU', 'TSSU', 'TTNU', 'TXGU', 'UESU',
-    'UETU', 'UNIU', 'WCIU', 'XINU', 'FFAU', 'FANU', 'CCLU',
+    'UETU', 'UNIU', 'WCIU', 'XINU', 'FFAU', 'FANU', 'CCLU', 'ATLU',
 })
 
 # ISO 6346 Container Size-Type Code pattern (e.g. 45G1, 22G1, 42G1, L5G1, '2 2 G 1')
@@ -198,13 +198,15 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
 
     # 2. 10-char repairs:
     # (a) Missing check digit repair (4 letters + 6 digits -> 11 chars)
+    # Only synthesize a check digit if the prefix is an established shipping line BIC code
     if len(compact) == 10 and re.fullmatch(r'[A-Z]{3}[UJZ][0-9]{6}', compact):
-        try:
-            cand = compact + str(check_digit(compact))
-            if STRUCTURE.fullmatch(cand) and _levenshtein(compact, cand) <= 2:
-                valid_candidates.add(cand)
-        except Exception:
-            pass
+        if compact[:4] in STANDARD_BIC_PREFIXES:
+            try:
+                cand = compact + str(check_digit(compact))
+                if STRUCTURE.fullmatch(cand) and _levenshtein(compact, cand) <= 2:
+                    valid_candidates.add(cand)
+            except Exception:
+                pass
 
     # (b) Glare / corrugation 1-dropped-owner-letter repair (3 prefix chars + 7 digits, e.g. '0CI7257753' -> 'OOCU7257753')
     if len(compact) == 10 and re.fullmatch(r'[A-Z0-9]{3}[0-9]{7}', compact):

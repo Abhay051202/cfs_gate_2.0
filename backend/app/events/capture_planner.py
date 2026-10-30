@@ -44,6 +44,21 @@ def plan_captures(group, confirmations):
     reliable_twin = reliable_twin and not conflicts
     if not reliable_twin and len(numbers) > 1:
         from app.database.repositories.gate import GateRepository
+        from app.ocr.validator import STANDARD_BIC_PREFIXES
+
+        def _candidate_score(num: str, records: list) -> float:
+            votes = sum(c for _, _, c in records)
+            max_conf = 0.0
+            has_iso = False
+            for _, r, _ in records:
+                read_info = r.reads.get(num)
+                if read_info and read_info[0]:
+                    max_conf = max(max_conf, float(getattr(read_info[0], 'confidence', 0.0) or 0.0))
+                    if getattr(read_info[0], 'size_type', None):
+                        has_iso = True
+            is_bic = num[:4] in STANDARD_BIC_PREFIXES
+            return votes * 2.0 + max_conf + (2.5 if has_iso else 0.0) + (1.5 if is_bic else 0.0)
+
         merged = {}
         for n, records in numbers.items():
             matched_w = None
@@ -52,9 +67,9 @@ def plan_captures(group, confirmations):
                     matched_w = w
                     break
             if matched_w:
-                w_votes = sum(c for _, _, c in merged[matched_w])
-                n_votes = sum(c for _, _, c in records)
-                if n_votes > w_votes:
+                w_score = _candidate_score(matched_w, merged[matched_w])
+                n_score = _candidate_score(n, records)
+                if n_score > w_score:
                     merged[n] = merged.pop(matched_w) + records
                 else:
                     merged[matched_w].extend(records)

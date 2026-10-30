@@ -1305,10 +1305,11 @@ class GateRuntime:
                 if self.detector is not None:
                     with self._accelerator:
                         detections = self.detector.detect(frame_obj)
+                roi = cam_cfg.occupancy_roi if cam_cfg and cam_cfg.occupancy_roi else (0.0, 0.0, 1.0, 1.0)
                 num_dets = [
                     d for d in detections
                     if d.class_name == 'container_number'
-                    and (not cam_cfg or not cam_cfg.occupancy_roi or inside_gate(d.bbox, img.shape, cam_cfg.occupancy_roi))
+                    and inside_gate(d.bbox, img.shape, roi)
                 ]
                 num_dets.sort(key=lambda d: d.confidence, reverse=True)
                 matched_val = None
@@ -1324,10 +1325,20 @@ class GateRuntime:
                     read = self._read_ocr(crop_img)
                     val = self.validator.validate(read)
                     if val.valid_check_digit and val.confidence >= self.settings.ocr_min_confidence:
-                        if not known_numbers or val.normalized_text in known_numbers:
-                            matched_val = val
-                            matched_det = nd
-                            break
+                        matched_val = val
+                        matched_det = nd
+                        break
+                if matched_val is None:
+                    # If YOLO missed the text box on this context frame, run OCR directly on the lane ROI crop
+                    rx1, ry1 = max(0, int(roi[0] * w)), max(0, int(roi[1] * h))
+                    rx2, ry2 = min(w, int(roi[2] * w)), min(h, int(roi[3] * h))
+                    roi_crop = img[ry1:ry2, rx1:rx2]
+                    if roi_crop.size > 0:
+                        read_roi = self._read_ocr(roi_crop)
+                        val_roi = self.validator.validate(read_roi)
+                        if val_roi.valid_check_digit and val_roi.confidence >= self.settings.ocr_min_confidence:
+                            matched_val = val_roi
+                            matched_det = Detection(p.camera_id, cap_ts, 'container_number', val_roi.confidence, (float(rx1), float(ry1), float(rx2), float(ry2)))
                 if matched_val is None:
                     continue
                 known_numbers.add(matched_val.normalized_text)
