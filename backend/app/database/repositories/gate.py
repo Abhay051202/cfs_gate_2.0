@@ -152,16 +152,20 @@ def _select_best_companion_frame(visit_dir, camera_id, anchor_timestamp):
         for ctx in ctx_frames:
             meta_file = ctx.with_suffix('.json')
             dt = None
+            has_container = False
             if meta_file.is_file():
                 try:
                     import json
                     meta = json.loads(meta_file.read_text(encoding='utf-8'))
+                    has_container = bool(meta.get('has_container', False))
                     ts_str = meta.get('captured_at', '')
                     if ts_str:
                         from datetime import datetime
                         dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
                 except Exception:
                     pass
+            if not has_container:
+                continue
             if dt and anchor_timestamp:
                 drift = abs((dt - anchor_timestamp).total_seconds())
                 if drift <= 6.0:
@@ -519,7 +523,10 @@ class GateRepository:
                             select(Camera).where(Camera.gate_id == passage.gate_id, Camera.enabled == True)
                         ).scalars().all()}
                         for matched_cam in sorted(valid_cameras):
-                            if matched_cam in existing_snaps:
+                            cam_existing = [s for s in existing_snap_rows if s.camera_id == matched_cam]
+                            has_real_proof = any('_proof' in (s.image_path or '') for s in cam_existing)
+                            has_real_capture = any('_capture' in (s.image_path or '') for s in cam_existing)
+                            if has_real_proof or has_real_capture:
                                 continue
                             anchor_dt = existing.timestamp if hasattr(existing.timestamp, 'timestamp') else None
                             chosen_file = _select_best_companion_frame(visit_dir, matched_cam, anchor_dt)
@@ -527,7 +534,8 @@ class GateRepository:
                                 continue
                             snap_id = str(uuid4())
                             det_id = str(uuid4())
-                            durable_name = f'{matched_cam}_{snap_id}_context.jpg'
+                            suffix_tag = 'capture' if '_capture_' in chosen_file.name else 'context'
+                            durable_name = f'{matched_cam}_{snap_id}_{suffix_tag}.jpg'
                             durable_abs = visit_dir / durable_name
                             try:
                                 import shutil
@@ -537,16 +545,20 @@ class GateRepository:
                                 rel_path = f'{proof_folder}/{durable_name}'
                             except Exception:
                                 continue
-                            session.add(DetectionRecord(
-                                id=det_id, event_id=existing.id, camera_id=matched_cam,
-                                origin_key=f'final:{existing.id}:{snap_id}', track_id=-1,
-                                class_name='context_roi', confidence=1.0,
-                                bbox=[0.0, 0.0, 2560.0, 1440.0], timestamp=existing.timestamp
-                            ))
-                            session.add(Snapshot(
-                                id=snap_id, event_id=existing.id, camera_id=matched_cam,
-                                image_path=rel_path, timestamp=existing.timestamp
-                            ))
+                            if cam_existing:
+                                for old_s in cam_existing:
+                                    old_s.image_path = rel_path
+                            else:
+                                session.add(DetectionRecord(
+                                    id=det_id, event_id=existing.id, camera_id=matched_cam,
+                                    origin_key=f'final:{existing.id}:{snap_id}', track_id=-1,
+                                    class_name='context_roi', confidence=1.0,
+                                    bbox=[0.0, 0.0, 2560.0, 1440.0], timestamp=existing.timestamp
+                                ))
+                                session.add(Snapshot(
+                                    id=snap_id, event_id=existing.id, camera_id=matched_cam,
+                                    image_path=rel_path, timestamp=existing.timestamp
+                                ))
                             existing_snaps.add(matched_cam)
                             existing.proof_version = (getattr(existing, 'proof_version', 1) or 1) + 1
                             existing.cloud_synced = False

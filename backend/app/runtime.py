@@ -1208,7 +1208,7 @@ class GateRuntime:
                 if confirmed_regions and not self.settings.strict_ocr_acceptance:
                     for p in group:
                         p_confirmed = any(_region_confirmed(r) for r in p.regions if not r.context_only)
-                        if p_confirmed or coverage:
+                        if p_confirmed or p.closed:
                             for r in p.regions:
                                 r.candidates.clear()
                                 r.pending = 0

@@ -13,10 +13,10 @@ class VisitCapture:
     def observe(self, camera, frame, passages, detections):
         if not self.settings.visit_capture_enabled:
             return
-        live = {p.visit_id or p.id for p in passages if not p.saved}
+        live = {p.visit_id or p.id for p in passages if not p.closed}
         self.samples = {k: v for k, v in self.samples.items() if k[0] in live}
         for p in passages:
-            if p.saved or p.closed or p.camera_id != camera.id or p.source_id != frame.source_id:
+            if p.closed or p.camera_id != camera.id or p.source_id != frame.source_id:
                 continue
             if p.last_seen != frame.timestamp:
                 continue
@@ -45,7 +45,9 @@ class VisitCapture:
             ok, data = cv2.imencode('.jpg', frame.image, [cv2.IMWRITE_JPEG_QUALITY, 94])
             if not ok:
                 continue
-            folder = self.snapshots.ensure_event_dir(visit, category='waiting')
+            cat = self.snapshots.category_for(p.direction)
+            promoted_dir = (self.snapshots.root / cat / visit) if getattr(self.snapshots, 'categorized', False) else None
+            folder = promoted_dir if (promoted_dir and promoted_dir.is_dir()) else self.snapshots.ensure_event_dir(visit, category='waiting')
             path = folder / f'{camera.id}_capture_{slot:03d}.jpg'
             temporary = path.with_suffix('.jpg.tmp')
             temporary.write_bytes(data.tobytes())
