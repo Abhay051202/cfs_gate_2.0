@@ -50,7 +50,23 @@ class PaddleOCREngine:
         from pathlib import Path
         from rapidocr_onnxruntime import RapidOCR
         # Initialize RapidOCR with CPU fallback session
-        self.engine = RapidOCR(det_limit_type='max', det_limit_side_len=960, intra_op_num_threads=4, inter_op_num_threads=1)
+        use_gpu = getattr(settings, 'ocr_gpu', True)
+        rapid_kwargs = {
+            'det_limit_type': 'max',
+            'det_limit_side_len': 960,
+            'intra_op_num_threads': 4,
+            'inter_op_num_threads': 1,
+        }
+        if use_gpu:
+            rapid_kwargs.update({
+                'Det_use_cuda': True,
+                'Rec_use_cuda': True,
+                'Cls_use_cuda': True,
+            })
+        try:
+            self.engine = RapidOCR(**rapid_kwargs)
+        except Exception:
+            self.engine = RapidOCR(det_limit_type='max', det_limit_side_len=960, intra_op_num_threads=4, inter_op_num_threads=1)
         
         # Accelerate with TensorRT GPU engines if available
         use_gpu = getattr(settings, 'ocr_gpu', True)
