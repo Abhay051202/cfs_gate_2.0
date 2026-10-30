@@ -46,7 +46,7 @@ async def live(socket: WebSocket, camera_id: str):
                 await socket.send_text('waiting')
             else:
                 await socket.send_bytes(jpeg)
-            await asyncio.sleep(.01)
+            await asyncio.sleep(0.001)
     except WebSocketDisconnect:
         pass
 
@@ -79,6 +79,9 @@ class LaneCalibration(BaseModel):
     exit_line: float = 0.95
     gate_exit_axis: Literal['x', 'y'] | None = None
     gate_exit_positive: bool = True
+    proof_capture_axis: Literal['x', 'y'] | None = None
+    proof_capture_position: float = Field(default=.5, gt=0, lt=1)
+    proof_capture_positive: bool = True
 
 
 @router.get('/calibration/all')
@@ -240,6 +243,19 @@ class ExposureSetting(BaseModel):
     mode: Literal['auto', 'manual'] = 'auto'
 
 
+class NightOptimizationParams(BaseModel):
+    day_max_shutter_ms: float = Field(default=4.0, gt=0.1, le=40.0, description='Max day shutter in ms (4.0ms = 1/250s)')
+    night_max_shutter_ms: float = Field(default=6.0, gt=0.1, le=40.0, description='Max night shutter in ms (6.0ms = ~1/170s)')
+    gain_max: int = Field(default=75, ge=10, le=100)
+    tnf_level: int = Field(default=20, ge=0, le=100, description='3D Temporal Noise Reduction (lower prevents motion ghosting)')
+    snf_level: int = Field(default=45, ge=0, le=100, description='3D Spatial Noise Reduction')
+    sharpness: int = Field(default=65, ge=0, le=100)
+    light_power: int = Field(default=50, ge=0, le=100)
+    bitrate_kbps: int = Field(default=6144, ge=1024, le=16384)
+    gop: int = Field(default=25, ge=10, le=100)
+    color_mode: bool = Field(default=True, description='Keep camera in Full Color mode instead of switching to B&W IR')
+
+
 @router.get('/{camera_id}/exposure')
 def camera_exposure(camera_id: str, request: Request):
     from app.camera.lens_control import get_lens_client_for_camera
@@ -256,3 +272,33 @@ def set_camera_exposure(camera_id: str, body: ExposureSetting, request: Request)
     if not client:
         raise HTTPException(400, 'Exposure control not supported for this camera')
     return client.set_shutter_speed(body.shutter, mode=body.mode)
+
+
+@router.post('/{camera_id}/optimize-night')
+def optimize_camera_night(camera_id: str, request: Request, body: NightOptimizationParams | None = None):
+    from app.camera.lens_control import get_lens_client_for_camera
+    params = body or NightOptimizationParams()
+    client = get_lens_client_for_camera(request.app.state.runtime, camera_id)
+    if not client:
+        raise HTTPException(400, 'Night imaging optimization not supported for this camera')
+    return {'camera_id': camera_id, **client.optimize_night_imaging(**params.model_dump())}
+
+
+@router.post('/optimize-night')
+def optimize_all_cameras_night(request: Request, body: NightOptimizationParams | None = None):
+    from concurrent.futures import ThreadPoolExecutor
+    from app.camera.lens_control import get_lens_client_for_camera
+    params = body or NightOptimizationParams()
+    runtime = request.app.state.runtime
+    clients = [
+        (cam.id, get_lens_client_for_camera(runtime, cam.id))
+        for cam in runtime.cameras
+    ]
+    active = [(cid, c) for cid, c in clients if c is not None]
+    results = {}
+    if active:
+        with ThreadPoolExecutor(max_workers=len(active)) as pool:
+            futs = {cid: pool.submit(c.optimize_night_imaging, **params.model_dump()) for cid, c in active}
+            for cid, fut in futs.items():
+                results[cid] = fut.result()
+    return {'optimized_cameras': len(results), 'results': results}

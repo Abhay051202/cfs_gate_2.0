@@ -1,4 +1,17 @@
 from __future__ import annotations
+import os
+
+# Suppress thread contention and enforce low-latency RTSP defaults before native math libraries load
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("ORT_ARENA_EXTEND_STRATEGY", "kSameAsRequested")
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|fflags;nobuffer+discardcorrupt|flags;low_delay|framedrop;1|max_delay;100000|probesize;131072|analyzeduration;500000"
+)
 from contextlib import asynccontextmanager
 import asyncio
 import functools

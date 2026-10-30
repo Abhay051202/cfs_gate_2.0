@@ -3,7 +3,7 @@ from app.domain import OCRRead
 from app.ocr.validator import ContainerValidator
 
 
-def assess_identity(event, minimum=.85, minimum_cameras=2):
+def assess_identity(event, minimum=.90, minimum_cameras=2):
     detections = {d['id']: d for d in event.get('detections', []) if d.get('id')}
     numbers = [event.get('container_number')]
     if event.get('is_twin'):
@@ -17,8 +17,7 @@ def assess_identity(event, minimum=.85, minimum_cameras=2):
             if not detection:
                 continue
             value = validator.validate(OCRRead(reading.get('raw_text') or '', float(reading.get('confidence') or 0)))
-            reading_min = 0.80 if len(cameras) >= 1 else minimum
-            if not value.valid_check_digit or value.confidence < reading_min:
+            if not value.valid_check_digit or value.confidence < minimum:
                 continue
             if value.normalized_text != number:
                 alternatives.add(value.normalized_text)
@@ -32,5 +31,7 @@ def assess_identity(event, minimum=.85, minimum_cameras=2):
             reasons.append(f'{number or "Unread identity"}: requires matching complete OCR from {minimum_cameras} cameras and at least two source frames')
         if alternatives and not event.get('is_twin'):
             reasons.append('Conflicting complete OCR identities require review: ' + ', '.join(sorted(alternatives)))
+    if event.get('identity_conflict'):
+        reasons.append('Different identifiers occupy the same text region; manual review required')
     return {'accepted': bool(numbers) and not reasons, 'supports': supports,
             'reason': '; '.join(reasons), 'minimum_confidence': minimum}

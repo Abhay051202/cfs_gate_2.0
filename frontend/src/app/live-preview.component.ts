@@ -30,10 +30,16 @@ export class LivePreviewComponent implements OnInit, OnDestroy {
   }
   next() {
     clearTimeout(this.timer);
-    // Request only after display: at most one frame in flight, never a replay backlog.
-    this.timer = setTimeout(() => {
-      if (this.socket?.readyState === WebSocket.OPEN) this.socket.send('next');
-    }, 66);
+    // Request next frame promptly using requestAnimationFrame to eliminate artificial lag and deliver real-time preview
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => {
+        if (this.socket?.readyState === WebSocket.OPEN) this.socket.send('next');
+      });
+    } else {
+      this.timer = setTimeout(() => {
+        if (this.socket?.readyState === WebSocket.OPEN) this.socket.send('next');
+      }, 10);
+    }
   }
   ngOnDestroy() {
     this.destroyed = true;

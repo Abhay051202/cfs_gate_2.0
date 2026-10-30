@@ -2,71 +2,111 @@
   "gate-in-1": {
     "lanes": [],
     "occupancy_roi": [
-      0.3057520689904935,
-      0.27470336853193206,
-      0.8391264353728914,
+      0.15817040967290108,
+      0.05,
+      0.803490433195884,
       1.0
     ],
     "entry_line": 0.36,
     "exit_line": 0.79,
-    "gate_exit_axis": "x",
+    "gate_exit_axis": null,
     "gate_exit_positive": true,
-    "version": 1
+    "version": 1,
+    "proof_capture_axis": null,
+    "proof_capture_position": 0.77,
+    "proof_capture_positive": true
   },
   "gate-in-2": {
-    "lanes": [],
+    "camera_id": "gate-in-2",
     "occupancy_roi": [
-      0.22731466216955262,
-      0.3340897894692575,
-      0.8095970586873608,
-      1.0
+      0.05,
+      0.08,
+      0.96,
+      0.98
     ],
+    "lanes": [],
     "entry_line": 0.9,
     "exit_line": 0.36,
-    "gate_exit_axis": "y",
+    "gate_exit_axis": null,
     "gate_exit_positive": false,
+    "gate_clear_seconds": 7.0,
+    "proof_capture_axis": null,
+    "proof_capture_position": 0.59,
+    "proof_capture_positive": true,
     "version": 1
   },
   "gate-in-3": {
+    "camera_id": "gate-in-3",
     "lanes": [],
     "occupancy_roi": [
-      0.26699476209073447,
-      0.1729097118894899,
-      0.8197477819230119,
-      1.0
+      0.28,
+      0.08,
+      0.98,
+      0.98
     ],
     "entry_line": 0.79,
     "exit_line": 0.3,
-    "gate_exit_axis": "x",
+    "gate_exit_axis": null,
     "gate_exit_positive": false,
-    "version": 1
+    "version": 1,
+    "proof_capture_axis": null,
+    "proof_capture_position": 0.4,
+    "proof_capture_positive": true
   },
   "gate-out-1": {
+    "camera_id": "gate-out-1",
     "lanes": [],
     "occupancy_roi": [
-      0.22,
-      0.08629081999451295,
-      0.9978468350576188,
-      1.0
+      0.26,
+      0.05,
+      0.78,
+      0.96
     ],
     "entry_line": 0.9,
     "exit_line": 0.15,
-    "gate_exit_axis": "y",
+    "gate_exit_axis": null,
     "gate_exit_positive": false,
-    "version": 1
+    "version": 1,
+    "proof_capture_axis": null,
+    "proof_capture_position": 0.5,
+    "proof_capture_positive": true
   },
   "gate-out-2": {
-    "lanes": [],
+    "camera_id": "gate-out-2",
     "occupancy_roi": [
-      0.0,
-      0.22212500275354105,
-      0.68,
-      1.0
+      0.2,
+      0.05,
+      0.82,
+      0.96
     ],
+    "lanes": [],
     "entry_line": 0.26,
     "exit_line": 0.94,
-    "gate_exit_axis": "y",
+    "gate_exit_axis": null,
     "gate_exit_positive": true,
+    "gate_clear_seconds": 7.0,
+    "proof_capture_axis": null,
+    "proof_capture_position": 0.5,
+    "proof_capture_positive": true,
+    "version": 1
+  },
+  "gate-out-3": {
+    "camera_id": "gate-out-3",
+    "occupancy_roi": [
+      0,
+      0,
+      1,
+      1
+    ],
+    "lanes": [],
+    "entry_line": 0.35,
+    "exit_line": 0.85,
+    "gate_exit_axis": null,
+    "gate_exit_positive": true,
+    "gate_clear_seconds": 7.0,
+    "proof_capture_axis": null,
+    "proof_capture_position": 0.5,
+    "proof_capture_positive": true,
     "version": 1
   }
 }

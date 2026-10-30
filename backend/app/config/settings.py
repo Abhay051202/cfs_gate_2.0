@@ -52,6 +52,9 @@ class CameraConfig(BaseModel):
     gate_exit_axis: Literal['x', 'y'] | None = None
     gate_exit_position: float = Field(default=.95, gt=0, lt=1)
     gate_exit_positive: bool = True
+    proof_capture_axis: Literal['x', 'y'] | None = None
+    proof_capture_position: float = Field(default=.5, gt=0, lt=1)
+    proof_capture_positive: bool = True
 
     @model_validator(mode='after')
     def validate_geometry(self):
@@ -80,6 +83,13 @@ class Settings(BaseSettings):
     vehicle_visit_tracking: bool = True
     minimum_number_proof_cameras: int = Field(default=1, ge=1, le=16)
     shared_visit_folders: bool = True
+    proof_capture_enabled: bool = True
+    proof_sync_tolerance_seconds: float = Field(default=.3, gt=0, le=1)
+    proof_buffer_frames: int = Field(default=12, ge=2, le=60)
+    proof_buffer_mb: int = Field(default=24, ge=4, le=128)
+    visit_capture_interval_seconds: float = Field(default=1, ge=.2, le=10)
+    visit_capture_enabled: bool = True
+    visit_capture_max_frames: int = Field(default=24, ge=3, le=120)
     container_roi_trigger: bool = True
     minimum_text_trigger_height_ratio: float = Field(default=0.025, ge=0, le=0.2)
     reversal_grace_seconds: float = Field(default=30, ge=0, le=300)
@@ -114,6 +124,7 @@ class Settings(BaseSettings):
     ocr_max_attempts: int = Field(default=4, ge=1)
     ocr_interval_seconds: float = Field(default=.5, gt=0)
     ocr_queue_size: int = Field(default=8, ge=1, le=100)
+    ocr_workers: int = Field(default=2, ge=1, le=8)
     # The spool is a temporary OCR work area. Definitive event evidence is
     # stored under snapshots, so this must stay bounded on an edge device.
     ocr_spool_max_mb: int = Field(default=2048, ge=256)

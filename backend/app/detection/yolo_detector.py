@@ -88,5 +88,11 @@ class YoloDetector:
                         bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
                         if bw < 32.0 or bh < 10.0:
                             continue
+                        # Filter camera OSD timestamp / channel header (top banner) and watermark (bottom banner)
+                        if width >= 1280 and height >= 720:
+                            if bbox[3] <= 0.16 * height and bbox[1] <= 0.06 * height:
+                                continue
+                            if bbox[2] <= 0.25 * width and bbox[1] >= 0.85 * height:
+                                continue
                     detections.append(Detection(frame.camera_id, frame.timestamp, name, confidence, bbox))
         return detections

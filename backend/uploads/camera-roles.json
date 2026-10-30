@@ -1,10 +1,42 @@
 {
+  "gate-in-1": {
+    "role": "REAR",
+    "direction": "ENTRY",
+    "gate_id": "lane-in",
+    "name": "Gate IN 1 (Rear)",
+    "line_axis": null,
+    "ocr_roi": [0.04, 0.05, 0.65, 0.98]
+  },
+  "gate-in-2": {
+    "role": "RIGHT",
+    "direction": "ENTRY",
+    "gate_id": "lane-in",
+    "name": "Gate IN 2 (Right)",
+    "line_axis": null,
+    "ocr_roi": [0.05, 0.08, 0.96, 0.98]
+  },
+  "gate-in-3": {
+    "role": "LEFT",
+    "direction": "ENTRY",
+    "gate_id": "lane-in",
+    "name": "Gate IN 3 (Left)",
+    "line_axis": null,
+    "ocr_roi": [0.28, 0.08, 0.98, 0.98]
+  },
   "gate-out-1": {
     "role": "REAR",
     "direction": "EXIT",
     "gate_id": "lane-out",
     "name": "Gate OUT 1 (Rear/Lane)",
     "line_axis": null,
-    "ocr_roi": [0, 0, 1, 1]
+    "ocr_roi": [0.26, 0.05, 0.78, 0.96]
+  },
+  "gate-out-2": {
+    "role": "FRONT_TOP",
+    "direction": "EXIT",
+    "gate_id": "lane-out",
+    "name": "Gate OUT 2 (Front/Approach)",
+    "line_axis": null,
+    "ocr_roi": [0.20, 0.05, 0.82, 0.96]
   }
 }

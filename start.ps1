@@ -106,5 +106,6 @@ if (-not $NoBrowser) {
 }
 
 Set-Location $backendRoot
-& $backendPython -m uvicorn app.main:app --host $HostAddress --port $Port --workers 1 --no-access-log
+$env:PORT = "$Port"
+& $backendPython run_server.py
 exit $LASTEXITCODE

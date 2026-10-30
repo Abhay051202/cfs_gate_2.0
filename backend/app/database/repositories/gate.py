@@ -227,9 +227,9 @@ class GateRepository:
                         from dataclasses import replace as _dc_replace
                         max_conf = max(old[0].confidence, validation.confidence)
                         if new_score > old_score:
-                            entry['proofs'][camera_id] = (_dc_replace(validation, confidence=max_conf), job)
+                            entry['proofs'][camera_id] = (validation, job)
                         else:
-                            entry['proofs'][camera_id] = (_dc_replace(old[0], confidence=max_conf), old[1])
+                            entry['proofs'][camera_id] = old
                 if not entry['proofs'] and number in region.reads:
                     validation,job = region.reads[number]
                     entry['votes'][job.detection.camera_id] = count
@@ -245,7 +245,7 @@ class GateRepository:
                     if cam_id not in entry['proofs']:
                         raw = (getattr(b_val, 'raw_text', '') or '').strip()
                         norm = (getattr(b_val, 'normalized_text', '') or '').strip()
-                        if (raw and self._same_container_id(raw, n)) or (norm and self._same_container_id(norm, n)):
+                        if (norm == n) or (passage.selected_numbers is None and raw and self._same_container_id(raw, n)):
                             entry['proofs'][cam_id] = (b_val, b_job)
         # Rank numbers strictly by OCR validation quality, valid check digit, confidence, and total votes
         from app.ocr.validator import check_digit, STRUCTURE
@@ -256,7 +256,7 @@ class GateRepository:
             return _quality(n, best_proof_val) + (total_votes * 25.0)
 
         numbers = sorted(entries, key=_entry_quality, reverse=True)
-        if len(numbers) == 2:
+        if len(numbers) == 2 and passage.selected_numbers is None:
             n1, n2 = numbers
             obj1 = entries[n1]['proofs'].get(list(entries[n1]['proofs'])[0])[0] if entries[n1]['proofs'] else None
             obj2 = entries[n2]['proofs'].get(list(entries[n2]['proofs'])[0])[0] if entries[n2]['proofs'] else None
@@ -289,7 +289,8 @@ class GateRepository:
             (sum(e['votes'].values()) >= 1 and any(v.valid_check_digit and v.confidence >= 0.50 for v,_ in e['proofs'].values()))
             for e in entries.values()
         )
-        status = 'CONFIRMED' if confirmed else ('CAPTURED' if numbers else 'UNREADABLE')
+        status = ('NEEDS_REVIEW' if passage.identity_conflict else
+                  ('CONFIRMED' if confirmed else ('CAPTURED' if numbers else 'UNREADABLE')))
         shared_folder = any(region.best_any and region.best_any[1].passage_metadata.get('shared_visit_folder')
                             for region in passage.regions)
         visit_id = (passage.visit_id or passage.id) if shared_folder else None
@@ -301,35 +302,36 @@ class GateRepository:
                 best = [max(entries[n]['proofs'].values(),key=lambda p:p[0].confidence)[0] for n in numbers]
                 matched_existing = None
                 pair_as_twin = False
-                if visit_id:
-                    cand_ev = session.execute(
-                        select(GateEvent).where(
-                            GateEvent.id != passage.id,
-                            (GateEvent.visit_id == visit_id) | (GateEvent.id == visit_id)
-                        ).order_by(GateEvent.timestamp.desc())
-                    ).scalars().first()
-                    if cand_ev:
-                        c_num = (cand_ev.container_number or '').strip().upper()
-                        cand_num = numbers[0].strip().upper() if numbers else ''
-                        c_iso = (cand_ev.iso_code_1 or '').strip().upper()
-                        n_iso = (best[0].size_type or '').strip().upper() if best else ''
-                        if (
-                            not twin and len(numbers) == 1 and not cand_ev.is_twin
-                            and len(c_num) == 11 and len(cand_num) == 11
-                            and c_num[3] == 'U' and cand_num[3] == 'U'
-                            and not self._same_container_id(c_num, cand_num)
-                            and not c_iso.startswith(('4', 'L'))
-                            and not n_iso.startswith(('4', 'L'))
-                            and (c_iso.startswith('2') or n_iso.startswith('2'))
-                        ):
-                            matched_existing = cand_ev
-                            pair_as_twin = True
-                        elif self._same_container_id(c_num, cand_num):
-                            matched_existing = cand_ev
-                        elif not c_num or len(c_num) != 11 or (c_num[3] != 'U' and cand_num and cand_num[3] == 'U'):
-                            matched_existing = cand_ev
-                        else:
-                            matched_existing = None
+                if visit_id and numbers:
+                    candidates = session.scalars(select(GateEvent).where(
+                        GateEvent.visit_id == visit_id,
+                        GateEvent.id != passage.id,
+                        GateEvent.gate_id == passage.gate_id,
+                        GateEvent.lane_id == passage.lane_id,
+                        GateEvent.event_type == passage.direction,
+                        GateEvent.status != 'DUPLICATE')).all()
+                    for candidate in candidates:
+                        known = {n for n in (candidate.container_number, candidate.container_number_2) if n}
+                        if known == set(numbers):
+                            matched_existing = candidate
+                            break
+
+                if not matched_existing and numbers and getattr(passage, 'source_type', 'file') == 'rtsp':
+                    window = timedelta(seconds=self.same_container_event_window_seconds)
+                    recent_same = session.scalars(select(GateEvent).where(
+                        GateEvent.id != passage.id,
+                        GateEvent.gate_id == passage.gate_id,
+                        GateEvent.lane_id == passage.lane_id,
+                        GateEvent.event_type == passage.direction,
+                        GateEvent.status != 'DUPLICATE',
+                        GateEvent.timestamp >= passage.started - window,
+                        GateEvent.timestamp <= passage.started + window,
+                    ).order_by(GateEvent.timestamp.desc())).all()
+                    for candidate in recent_same:
+                        known = {n for n in (candidate.container_number, candidate.container_number_2) if n}
+                        if known == set(numbers) or (len(numbers) == 1 and len(known) == 1 and self._same_container_id(numbers[0], next(iter(known)))):
+                            matched_existing = candidate
+                            break
 
                 recovered = self._recent_text_reread(session, passage, numbers)
                 if recovered and not matched_existing:
@@ -339,41 +341,6 @@ class GateRepository:
                                  'identities': numbers}))
                     # Do not replace the original proof with the later distant view.
                     return recovered.id
-
-                if not matched_existing and numbers:
-                    cand_num = numbers[0].strip().upper()
-                    n_iso = (best[0].size_type or '').strip().upper() if best else ''
-                    delta = timedelta(seconds=300.0)
-                    recent_events = session.execute(
-                        select(GateEvent).where(
-                            GateEvent.lane_id == passage.lane_id,
-                            GateEvent.gate_id == passage.gate_id,
-                            GateEvent.event_type == passage.direction,
-                            GateEvent.status != 'DUPLICATE',
-                            GateEvent.id != passage.id,
-                            GateEvent.timestamp >= passage.started - delta,
-                            GateEvent.timestamp <= passage.started + delta
-                        ).order_by(GateEvent.timestamp.desc())
-                    ).scalars().all()
-                    for ev in recent_events:
-                        c_num = (ev.container_number or '').strip().upper()
-                        c_num2 = (ev.container_number_2 or '').strip().upper()
-                        if not passage.chassis_observed and cand_num in (c_num, c_num2):
-                            matched_existing = ev
-                            break
-                        c_iso = (ev.iso_code_1 or '').strip().upper()
-                        if (
-                            not twin and len(numbers) == 1 and not ev.is_twin
-                            and abs((passage.started - ev.timestamp).total_seconds()) <= 25.0
-                            and len(c_num) == 11 and len(cand_num) == 11
-                            and c_num[3] == 'U' and cand_num[3] == 'U'
-                            and not c_iso.startswith(('4', 'L'))
-                            and not n_iso.startswith(('4', 'L'))
-                            and (c_iso.startswith('2') or n_iso.startswith('2'))
-                        ):
-                            matched_existing = ev
-                            pair_as_twin = True
-                            break
 
                 if matched_existing:
                     existing = matched_existing
@@ -404,7 +371,7 @@ class GateRepository:
                                 self.confidence = c
                                 self.size_type = st
                         existing_obj = _TmpObj(existing_best_conf, existing.iso_code_1)
-                        if _quality(numbers[0], best[0]) > _quality(existing.container_number, existing_obj):
+                        if passage.selected_numbers is None and _quality(numbers[0], best[0]) > _quality(existing.container_number, existing_obj):
                             old_cnum = existing.container_number
                             existing.container_number = numbers[0]
                             if best[0].size_type:
@@ -491,7 +458,11 @@ class GateRepository:
                             cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*_frame.png'))
                             if not cam_frames:
                                 continue
-                            chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
+                            ctx_frames = sorted(visit_dir.glob(f'{matched_cam}_context_*.jpg')) + sorted(visit_dir.glob(f'{matched_cam}_capture_*.jpg'))
+                            if ctx_frames:
+                                chosen_file = max(ctx_frames, key=lambda f: f.stat().st_mtime)
+                            else:
+                                chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
                             snap_id = str(uuid4())
                             det_id = str(uuid4())
                             durable_name = f'{matched_cam}_{snap_id}_context.jpg'
@@ -524,6 +495,7 @@ class GateRepository:
                     recent_unreadable = session.execute(
                         select(GateEvent).where(
                             GateEvent.lane_id == passage.lane_id,
+                            GateEvent.event_type == passage.direction,
                             GateEvent.container_number.is_(None)
                         ).order_by(GateEvent.timestamp.desc())
                     ).scalars().all()
@@ -539,13 +511,16 @@ class GateRepository:
                             existing_snaps = {s.camera_id for s in session.execute(
                                 select(Snapshot).where(Snapshot.event_id == unreadable_ev.id)
                             ).scalars().all()}
+                            base_folder = unreadable_ev.visit_id or unreadable_ev.id
+                            snapshots.promote_from_waiting(base_folder, unreadable_ev.event_type)
+                            cat = snapshots.category_for(unreadable_ev.event_type)
+                            proof_folder = f'{cat}/{base_folder}' if cat else base_folder
                             bundles = [(n,entries[n]['proofs']) for n in numbers]
                             for index,(number,proofs) in enumerate(bundles):
                                 for camera_id,(validation,job) in proofs.items():
                                     detection_id,snapshot_id = str(uuid4()),str(uuid4())
-                                    proof_folder = unreadable_ev.visit_id or unreadable_ev.id
                                     path = snapshots.save_side_snapshot(proof_folder,
-                                        f'{camera_id}_{snapshot_id}_proof',job.frame.image)
+                                        f'{camera_id}_{snapshot_id}_proof',job.frame.image, direction=unreadable_ev.event_type)
                                     created.append(path)
                                     session.add(DetectionRecord(id=detection_id,event_id=unreadable_ev.id,camera_id=camera_id,
                                         origin_key=f'final:{unreadable_ev.id}:{snapshot_id}',track_id=job.track_id,
@@ -564,11 +539,12 @@ class GateRepository:
                             unreadable_ev.cloud_synced = False
                             snapshots.save_event_json(unreadable_ev.id,self.event(unreadable_ev.id))
                             return unreadable_ev.id
-                else:
+                elif not numbers:
                     # Suppress unreadable duplicate if a recent event already exists on this lane
                     recent_lane_events = session.execute(
                         select(GateEvent).where(
-                            GateEvent.lane_id == passage.lane_id
+                            GateEvent.lane_id == passage.lane_id,
+                            GateEvent.event_type == passage.direction
                         ).order_by(GateEvent.timestamp.desc())
                     ).scalars().all()
                     for existing in recent_lane_events:
@@ -576,12 +552,15 @@ class GateRepository:
                             existing_snaps = {s.camera_id for s in session.execute(
                                 select(Snapshot).where(Snapshot.event_id == existing.id)
                             ).scalars().all()}
+                            base_folder = existing.visit_id or existing.id
+                            snapshots.promote_from_waiting(base_folder, existing.event_type)
+                            cat = snapshots.category_for(existing.event_type)
+                            proof_folder = f'{cat}/{base_folder}' if cat else base_folder
                             for camera_id,(validation,job) in unreadable.items():
                                 if camera_id not in existing_snaps:
                                     detection_id,snapshot_id = str(uuid4()),str(uuid4())
-                                    proof_folder = existing.visit_id or existing.id
                                     path = snapshots.save_side_snapshot(proof_folder,
-                                        f'{camera_id}_{snapshot_id}_proof',job.frame.image)
+                                        f'{camera_id}_{snapshot_id}_proof',job.frame.image, direction=existing.event_type)
                                     created.append(path)
                                     session.add(DetectionRecord(id=detection_id,event_id=existing.id,camera_id=camera_id,
                                         origin_key=f'final:{existing.id}:{snapshot_id}',track_id=job.track_id,
@@ -641,13 +620,17 @@ class GateRepository:
                         if matched_cam in saved_snaps:
                             continue
                         cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*_frame.png'))
-                        if not cam_frames:
-                            cam_frames = sorted(visit_dir.glob(f'{matched_cam}_context_*.jpg'))
-                        if not cam_frames:
-                            cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*proof*.jpg'))
-                        if not cam_frames:
-                            continue
-                        chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
+                        ctx_frames = sorted(visit_dir.glob(f'{matched_cam}_context_*.jpg')) + sorted(visit_dir.glob(f'{matched_cam}_capture_*.jpg'))
+                        if cam_frames and ctx_frames:
+                            chosen_file = max(ctx_frames, key=lambda f: f.stat().st_mtime)
+                        else:
+                            if not cam_frames:
+                                cam_frames = ctx_frames
+                            if not cam_frames:
+                                cam_frames = sorted(visit_dir.glob(f'{matched_cam}_*proof*.jpg'))
+                            if not cam_frames:
+                                continue
+                            chosen_file = max(cam_frames, key=lambda f: f.stat().st_size)
                         snap_id = str(uuid4())
                         det_id = str(uuid4())
                         durable_name = f'{matched_cam}_{snap_id}_context.jpg'
@@ -673,7 +656,8 @@ class GateRepository:
                         saved_snaps.add(matched_cam)
                 session.add(SystemLog(id=str(uuid4()),event_id=passage.id,level='INFO',
                     event_name='container_capture_finalized',context={'lane_id':passage.lane_id,
-                    'identities':numbers,'status':status,'visit_id':passage.visit_id or passage.id}))
+                    'identities':numbers,'status':status,'visit_id':passage.visit_id or passage.id,
+                    'identity_conflict': passage.identity_conflict}))
             snapshots.save_event_json(passage.id,self.event(passage.id))
             return passage.id
         except Exception:
@@ -1434,6 +1418,14 @@ class GateRepository:
             result['ocr_results'] = [serialize(o) for o in session.scalars(select(OCRResult).where(
                 OCRResult.detection_id.in_([d.id for d in detections])))]
             review_feedback(result, result['ocr_results'])
+            conflict = session.scalar(select(SystemLog.id).where(
+                SystemLog.event_id == event_id,
+                SystemLog.event_name == 'container_capture_finalized',
+                SystemLog.context['identity_conflict'].as_boolean() == True))
+            if conflict:
+                result['status'] = 'NEEDS_REVIEW'
+                result['review_reason'] = 'Different valid OCR numbers were read from the same text region; verify the identity.'
+                result['identity_conflict'] = True
             if row.status == 'DUPLICATE':
                 result['status'] = 'DUPLICATE'
             if self.strict_ocr_acceptance and row.status != 'DUPLICATE' and result.get('container_number'):
@@ -1611,6 +1603,13 @@ class GateRepository:
                             'image_path': str(path.relative_to(root)).replace('\\', '/')}
             return None
 
+    def mark_proof_pending(self, event_id: str, proof_version: int):
+        with self._write_lock, self.db.sessions.begin() as session:
+            event = session.get(GateEvent, event_id)
+            if event:
+                event.proof_version = max(event.proof_version or 1, proof_version)
+                event.cloud_synced = False
+
     def mark_cloud_synced(self, event_id: str, cloud_event_id: str | None = None, proof_version: int | None = None):
         with self._write_lock, self.db.sessions.begin() as session:
             ev = session.get(GateEvent, event_id)
@@ -1639,6 +1638,8 @@ class GateRepository:
                 )
             )
             if existing:
+                if (existing.proof_version or 1) > proof_version:
+                    return  # A slower request must not overwrite a newer acknowledgment.
                 existing.cloud_event_id = cloud_event_id
                 existing.image_path = image_path
                 existing.image_hash = image_hash
@@ -1960,30 +1961,21 @@ class GateRepository:
             if not event:
                 return event_id
             if event.capture_policy in ('FINAL_CAPTURE','UNREADABLE_CAPTURE'):
-                # Suppress duplicate cloud dispatch for same visit or matching container serial digits on same lane
-                delta = timedelta(seconds=180.0)
+                # Only the coordinator's visit ownership plus exact identity
+                # can collapse final records. Similar serial digits are unsafe.
+                if not event.visit_id:
+                    return event_id
+                identities = {n for n in (event.container_number, event.container_number_2) if n}
                 candidates = session.scalars(select(GateEvent).where(
-                    GateEvent.id != event.id,
-                    GateEvent.lane_id == event.lane_id,
+                    GateEvent.id != event.id, GateEvent.visit_id == event.visit_id,
+                    GateEvent.gate_id == event.gate_id, GateEvent.lane_id == event.lane_id,
+                    GateEvent.event_type == event.event_type,
                     GateEvent.status.in_(['CONFIRMED', 'NEEDS_REVIEW']),
-                    GateEvent.timestamp >= event.timestamp - delta,
-                    GateEvent.timestamp <= event.timestamp + delta,
-                ).order_by(GateEvent.timestamp.asc())).all()
-                num = (event.container_number or '').strip().upper()
-                for cand in candidates:
-                    if cand.timestamp > event.timestamp:
-                        continue
-                    c_num = (cand.container_number or '').strip().upper()
-                    if cand.visit_id and event.visit_id and cand.visit_id == event.visit_id:
-                        from app.ocr.validator import check_digit, STRUCTURE
-                        v_num = bool(len(num) == 11 and STRUCTURE.fullmatch(num) and check_digit(num[:10]) == int(num[10]))
-                        v_cnum = bool(len(c_num) == 11 and STRUCTURE.fullmatch(c_num) and check_digit(c_num[:10]) == int(c_num[10]))
-                        if v_num and v_cnum and num != c_num:
-                            continue
-                        if not (len(num) == 11 and len(c_num) == 11 and num[4:10] != c_num[4:10] and sum(a == b for a, b in zip(num, c_num)) < 6):
-                            return cand.id
-                    if c_num and num and self._same_container_id(c_num, num):
-                        return cand.id
+                    GateEvent.timestamp <= event.timestamp).order_by(GateEvent.timestamp.asc())).all()
+                for candidate in candidates:
+                    known = {n for n in (candidate.container_number, candidate.container_number_2) if n}
+                    if identities and identities == known:
+                        return candidate.id
                 return event_id
             delta = timedelta(seconds=max_gap_seconds)
             direction_match = (GateEvent.event_type == event.event_type) | (GateEvent.event_type == 'UNKNOWN')

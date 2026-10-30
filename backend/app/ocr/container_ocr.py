@@ -1,6 +1,51 @@
 from __future__ import annotations
 import math
 
+
+def stacked_number_strips(image):
+    """Lay out upright, vertically stacked glyphs without rotating letters."""
+    import cv2
+    import numpy as np
+    h, w = image.shape[:2]
+    if h < 2*w:
+        return []
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    masks = [cv2.threshold(gray, level, 255, cv2.THRESH_BINARY_INV)[1] for level in (20, 35)]
+    masks += [cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 11),
+        cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]]
+    candidates = []
+    for mask in masks:
+        long_lines = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, int(h*.18)))))
+        mask = cv2.subtract(mask, long_lines)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = [cv2.boundingRect(c) for c in contours]
+        boxes = [(x,y,bw,bh) for x,y,bw,bh in boxes if .018*h <= bh <= .14*h
+                 and .04*w <= bw <= .7*w and bw*bh >= 20]
+        for anchor in boxes:
+            center = anchor[0]+anchor[2]/2
+            column = sorted([b for b in boxes if abs(b[0]+b[2]/2-center) <= max(6,.14*w)], key=lambda b:b[1])
+            merged = []
+            for x,y,bw,bh in column:
+                if merged and y < merged[-1][1]+merged[-1][3]*.75:
+                    a,b,c,d = merged.pop()
+                    merged.append((min(a,x), min(b,y), max(a+c,x+bw)-min(a,x), max(b+d,y+bh)-min(b,y)))
+                else:
+                    merged.append((x,y,bw,bh))
+            if not 10 <= len(merged) <= 13:
+                continue
+            parts = []
+            for x,y,bw,bh in merged:
+                part = image[max(0,y-2):min(h,y+bh+2), max(0,x-2):min(w,x+bw+2)]
+                target_w = max(12, min(64, round(48*part.shape[1]/part.shape[0])))
+                part = cv2.resize(part, (target_w,48), interpolation=cv2.INTER_CUBIC)
+                parts.append(cv2.copyMakeBorder(part, 8,8,5,5,cv2.BORDER_CONSTANT,value=(255,255,255)))
+            signature = tuple(merged)
+            if not any(c[1] == signature for c in candidates):
+                candidates.append((abs(len(merged)-11), signature, np.concatenate(parts, axis=1)))
+    return [c[2] for c in sorted(candidates, key=lambda c:c[0])[:2]]
+
 def prepare_ocr_crop(image):
     """Upscale and improve contrast for small/angled container markings."""
     import cv2

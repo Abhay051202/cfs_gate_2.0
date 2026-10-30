@@ -92,6 +92,8 @@ class Passage:
     last_body_appearance: object = None
     # A gate visit reserves an observer before that camera detects a body.
     capture_only: bool = False
+    selected_numbers: tuple[str, ...] | None = None
+    identity_conflict: bool = False
 
 
 class PassageCollector:
@@ -104,6 +106,7 @@ class PassageCollector:
         self.health = {}
         self.recent = {}
         self._text_history = {}
+        self._visit_cameras = {}
 
     def _is_stationary_background_text(self, camera_id, timestamp, bbox) -> bool:
         """Detect parked background containers whose text bbox has not moved for >= 45s."""
@@ -162,6 +165,8 @@ class PassageCollector:
         return current is not None and similar(passage.last_body_appearance, current, .9)
 
     def update(self, camera, frame, detections):
+        live_visits = {p.visit_id or p.id for p in [*self.active.values(), *self.passages.values(), *self.recent.values()]}
+        self._visit_cameras = {v: cams for v, cams in self._visit_cameras.items() if v in live_visits}
         self.recent = {key:p for key,p in self.recent.items() if p.closed_at is not None and
                        (frame.timestamp-p.closed_at).total_seconds() <= self.settings.reversal_grace_seconds}
         key = (camera.id, frame.source_id)
@@ -265,8 +270,8 @@ class PassageCollector:
                        self._number_matches_recent_body(p,track.detection,frame))) or
                      (p.body_observed and track.detection.class_name in ('truck','trailer','vehicle','container')
                       and 0 <= (frame.timestamp-p.last_seen).total_seconds() <= 2
-                      and iou(p.bbox,track.detection.bbox) >= .5
-                      and (same_colour(p.appearance,track.appearance) or similar(p.appearance,track.appearance,.8))))]
+                      and iou(p.bbox,track.detection.bbox) >= (.15 if len(tracks) == 1 else .5)
+                      and (same_colour(p.appearance,track.appearance) or similar(p.appearance,track.appearance,.75))))]
                 if not same_view and camera.source_type == 'rtsp' and len(tracks) == 1:
                     same_view = [p for p in self.active.values() if p.camera_id == camera.id and
                                  p.source_id == frame.source_id and not p.closed and p.saved and
@@ -325,12 +330,16 @@ class PassageCollector:
                             visit = other.visit_id or other.id
                             # A following truck in the same camera cannot borrow
                             # an already observed visit from the other camera.
-                            if not any(p.camera_id == camera.id and not p.closed
-                                       and (p.visit_id or p.id) == visit for p in self.active.values()):
+                            if camera.id not in self._visit_cameras.get(visit, set()) and not any(
+                                    p.camera_id == camera.id and not p.capture_only
+                                    and (p.visit_id or p.id) == visit
+                                    for p in self.passages.values()):
                                 candidates[visit] = other
-                    if candidates and len(tracks) == 1:
+                    same_class_tracks = [t for t in tracks if t.detection.class_name == track.detection.class_name]
+                    if candidates and len(same_class_tracks) <= 1:
                         passage.visit_id = min(candidates.keys(), key=lambda v: candidates[v].started)
                 passage.visit_id = passage.visit_id or passage.id
+                self._visit_cameras.setdefault(passage.visit_id, set()).add(camera.id)
                 self.active[identity] = passage
                 if not passage.saved:
                     self.passages[passage.id] = passage
@@ -421,6 +430,10 @@ class PassageCollector:
                     passage.context = (quality,frame,body,(body,))
             for det in texts:
                 owners = [t for t in tracks if contains_text(t.detection.bbox, det.bbox)]
+                if len(owners) > 1:
+                    container_owners = [t for t in owners if t.detection.class_name == 'container']
+                    if len(container_owners) == 1:
+                        owners = container_owners
                 if len(owners) != 1 or owners[0].id != track.id:
                     if any(t.id == track.id for t in owners):
                         passage.ambiguous = True
@@ -478,30 +491,16 @@ class PassageCollector:
                 self.active.pop(identity)
                 continue
             if passage.last_seen != frame.timestamp:
-                # Virtual Laser Line: check if container or vehicle is dwelling inside gate ROI
-                h, w = frame.image.shape[:2]
-                rx1, ry1, rx2, ry2 = camera.occupancy_roi
-                still_dwelling = any(
-                    (d.class_name in ('container', 'truck', 'trailer', 'vehicle') or
-                     (d.class_name == 'container_number' and d.confidence >= 0.3)) and
-                    (rx1 - 0.05 <= (d.bbox[0] + d.bbox[2]) / (2 * w) <= rx2 + 0.05) and
-                    (ry1 - 0.05 <= (d.bbox[1] + d.bbox[3]) / (2 * h) <= ry2 + 0.05)
-                    for d in detections
-                )
-                if still_dwelling:
-                    # Vehicle is dwelling inside gate: keep passage open, do not timeout
+                if (passage.last_measured is None or
+                        (frame.timestamp-passage.last_measured).total_seconds() > self.settings.gate_observation_gap_seconds):
                     passage.clear_since = None
-                else:
-                    if (passage.last_measured is None or
-                            (frame.timestamp-passage.last_measured).total_seconds() > self.settings.gate_observation_gap_seconds):
-                        passage.clear_since = None
-                    passage.clear_since = passage.clear_since or frame.timestamp
-                    if (frame.timestamp-passage.clear_since).total_seconds() >= self.settings.gate_clear_seconds:
-                        passage.closed = True
-                        passage.closed_at = frame.timestamp
-                        self.active.pop(identity)
-                        if passage.saved:
-                            self.recent[passage.id] = passage
+                passage.clear_since = passage.clear_since or frame.timestamp
+                if (frame.timestamp-passage.clear_since).total_seconds() >= self.settings.gate_clear_seconds:
+                    passage.closed = True
+                    passage.closed_at = frame.timestamp
+                    self.active.pop(identity)
+                    if passage.saved:
+                        self.recent[passage.id] = passage
 
             # Virtual Laser Line: immediate clearance if vehicle crossed the exit tripwire
             if not passage.closed and passage.bbox:
@@ -564,10 +563,10 @@ class PassageCollector:
                 if old_validation.size_type and validation.size_type and old_validation.size_type != validation.size_type:
                     passage.ambiguous = True
                 if quality <= region.proof_quality.get(number,0):
-                    region.reads[number] = (replace(old_validation, confidence=best_conf, size_type=old_validation.size_type or validation.size_type), old_job)
+                    region.reads[number] = (replace(old_validation, size_type=old_validation.size_type or validation.size_type), old_job)
                     region.source_proofs.setdefault(number,{})[job.detection.camera_id] = region.reads[number]
                     return
-                validation = replace(validation, confidence=best_conf, size_type=validation.size_type or old_validation.size_type)
+                validation = replace(validation, size_type=validation.size_type or old_validation.size_type)
             region.reads[number] = (validation, job)
             region.source_proofs.setdefault(number,{})[job.detection.camera_id] = (validation,job)
             region.proof_quality[number] = quality
@@ -684,191 +683,5 @@ class PassageCollector:
 
 
 def final_captures(group, confirmations):
-    """Plan immutable, identity-isolated records from a completed visit group."""
-    from uuid import uuid5, NAMESPACE_URL
-    numbers = {}
-    unknown = []
-    for passage in group:
-        for region in passage.regions:
-            votes = region.votes.most_common()
-            if votes and not (len(votes)>1 and votes[0][1] == votes[1][1]):
-                number,count = votes[0]
-                numbers.setdefault(number,[]).append((passage,region,count))
-            elif len(votes) > 1 and votes[0][1] == votes[1][1] and sum(a == b for a, b in zip(votes[0][0], votes[1][0])) >= 6:
-                top_tie = [n for n, c in votes if c == votes[0][1] and sum(a == b for a, b in zip(n, votes[0][0])) >= 6]
-                best_n = max(
-                    top_tie,
-                    key=lambda n: (
-                        getattr(region.reads.get(n, (None,))[0], 'confidence', 0.0),
-                        region.proof_quality.get(n, 0.0),
-                    ),
-                )
-                total_c = sum(c for n, c in votes if n in top_tie)
-                numbers.setdefault(best_n, []).append((passage, region, total_c))
-            elif region.best_any:
-                unknown.append((passage,region))
-        if not numbers and not passage.regions and passage.context:
-            # Runtime persists this context as an explicit unreadable job before
-            # finalization; a missing detector number must not drop the visit.
-            raise ValueError('Departure context has not been persisted')
-    # Two IDs are twins only if one observer assigned them to the same measured
-    # truck and both have supported 20-foot ISO codes. Timing is not twin proof.
-    reliable_twin = len(numbers)==2 and any(
-        p.chassis_observed and not p.ambiguous and all(any(owner.id==p.id for owner,_,_ in records) for records in numbers.values())
-        for p in group)
-    reliable_twin = reliable_twin and all(
-        any(str(region.reads[number][0].size_type or '').startswith('2') for _,region,_ in records)
-        for number,records in numbers.items())
-    base = min((p.visit_id or p.id for p in group))
-    confirmed_numbers = {
-        n: records for n, records in numbers.items()
-        if sum(c for _, _, c in records) >= confirmations or (
-            sum(c for _, _, c in records) >= 1 and any(
-                r.reads.get(n) and getattr(r.reads[n][0], 'valid_check_digit', False) and getattr(r.reads[n][0], 'confidence', 0) >= 0.80
-                for _, r, _ in records
-            )
-        )
-    }
-    if reliable_twin:
-        cluster_groups = [list(numbers)]
-        bundles = [list(numbers)]
-    elif confirmed_numbers or numbers:
-        # Cluster OCR typo variants of the same container while preserving
-        # genuinely distinct container numbers (e.g., back-to-back trucks).
-        pool = confirmed_numbers if confirmed_numbers else numbers
-        KNOWN_PREFIXES = (
-            'MSKU', 'MEDU', 'MAEU', 'MRSU', 'MRKU', 'CMAU', 'TCNU', 'TGHU', 'TRHU',
-            'WHSU', 'WHLU', 'SPSU', 'KKTU', 'TEMU', 'TIIU', 'TLLU', 'TGBU', 'TEXU',
-            'TXEU', 'CAIU', 'FDCU', 'FCIU', 'FANU', 'HLBU', 'HLXU', 'ONEU', 'JFSU',
-            'DPWU', 'HASU', 'ESDU', 'SLZU', 'NKIU', 'MSMU', 'MSNU', 'BMOU', 'OOLU',
-            'EITU', 'EGHU', 'EISU', 'EMCU', 'HMMU', 'HDMU', 'YMLU', 'ZIMU', 'SEGU',
-        )
-        def _candidate_score(n):
-            records = pool[n]
-            total_votes = sum(c for _, _, c in records)
-            has_check = any(r.reads.get(n) and getattr(r.reads[n][0], 'valid_check_digit', False) for _, r, _ in records)
-            max_conf = max((getattr(r.reads[n][0], 'confidence', 0.0) for _, r, _ in records if n in r.reads), default=0.0)
-            cams = {p.camera_id for p, _, _ in records}
-            for _, r, _ in records:
-                cams.update(r.source_proofs.get(n, {}).keys())
-            cam_bonus = len(cams) * 120.0
-            cat_u_bonus = 150.0 if (len(n) == 11 and n[3] == 'U') else 0.0
-            iso_bonus = 80.0 if any(r.reads.get(n) and getattr(r.reads[n][0], 'size_type', None) for _, r, _ in records) else 0.0
-            horiz_bonus = 60.0 if any(
-                r.reads.get(n) and len(getattr(r.reads[n][1].detection, 'bbox', ())) == 4 and
-                (r.reads[n][1].detection.bbox[2] - r.reads[n][1].detection.bbox[0]) >
-                (r.reads[n][1].detection.bbox[3] - r.reads[n][1].detection.bbox[1])
-                for _, r, _ in records
-            ) else 0.0
-            prefix_bonus = 50.0 if n.startswith(KNOWN_PREFIXES) else 0.0
-            return (1000.0 if has_check else 0.0) + cat_u_bonus + cam_bonus + iso_bonus + horiz_bonus + (total_votes * 10.0) + max_conf + prefix_bonus
-
-        def _edit_distance(s1: str, s2: str) -> int:
-            dp = list(range(len(s2) + 1))
-            for i, c1 in enumerate(s1, 1):
-                new_dp = [i]
-                for j, c2 in enumerate(s2, 1):
-                    new_dp.append(min(dp[j] + 1, new_dp[-1] + 1, dp[j - 1] + (0 if c1 == c2 else 1)))
-                dp = new_dp
-            return dp[-1]
-
-        def _same_physical_container(a: str, b: str) -> bool:
-            if a == b:
-                return True
-            if len(a) == 11 and len(b) == 11:
-                if a[4:10] == b[4:10]:
-                    return True
-                if a[:4] == b[:4] and _edit_distance(a[4:], b[4:]) <= 2:
-                    return True
-                if a[3] == b[3] and _edit_distance(a[4:10], b[4:10]) <= 2 and sum(x == y for x, y in zip(a[:4], b[:4])) >= 2:
-                    return True
-                if _edit_distance(a, b) <= 3:
-                    return True
-            return sum(x == y for x, y in zip(a, b)) >= 6
-
-        clusters = []
-        for n in sorted(pool, key=_candidate_score, reverse=True):
-            placed = False
-            for cluster in clusters:
-                if any(_same_physical_container(n, existing_n) for existing_n in cluster):
-                    cluster.append(n)
-                    placed = True
-                    break
-            if not placed:
-                clusters.append([n])
-
-        if len(clusters) > 1:
-            # Drop non-'U' category noise clusters (e.g. 'J'/'Z' vertical rib misreads) when a 'U' container exists
-            u_clusters = [c for c in clusters if len(c[0]) == 11 and c[0][3] == 'U']
-            if u_clusters:
-                clusters = u_clusters
-        if len(clusters) > 1:
-            # Drop single-vote OCR noise clusters when a multi-vote confirmed cluster exists
-            multi_vote = [c for c in clusters if sum(cnt for _, _, cnt in pool[c[0]]) >= confirmations]
-            if multi_vote:
-                clusters = multi_vote
-        has_40ft = any(
-            str(getattr(r.reads[n][0], 'size_type', '') or '').startswith(('4', 'L'))
-            for n in pool for _, r, _ in pool[n] if n in r.reads
-        )
-        if len(clusters) > 1 and has_40ft:
-            # One non-twin RTSP truck visit carrying a 40ft/45ft container represents one physical container;
-            # only merge clusters if they are genuine typo variants of the top cluster, never distinct valid containers!
-            top_cluster = clusters[0]
-            kept_clusters = [top_cluster]
-            for other_cluster in clusters[1:]:
-                if any(_same_physical_container(n, top_n) for n in other_cluster for top_n in top_cluster):
-                    top_cluster.extend(other_cluster)
-                else:
-                    kept_clusters.append(other_cluster)
-            clusters = kept_clusters
-
-        cluster_groups = clusters
-        bundles = [[max(cluster, key=_candidate_score)] for cluster in clusters]
-    else:
-        cluster_groups = []
-        bundles = []
-
-    plans = []
-    for idx, bundle in enumerate(bundles):
-        member_nums = cluster_groups[idx] if idx < len(cluster_groups) else bundle
-        regions = []
-        seen_r = set()
-        for n in member_nums:
-            for _, r, _ in numbers.get(n, ()):
-                if id(r) not in seen_r:
-                    seen_r.add(id(r))
-                    regions.append(r)
-        owners = [p for n in member_nums for p, _, _ in numbers.get(n, ())]
-        first = min(owners,key=lambda p:(p.started,p.id))
-        identity = str(uuid5(NAMESPACE_URL,'gate-container:'+base+':'+','.join(sorted(bundle))))
-        plans.append(replace(first,id=identity,regions=regions,ambiguous=False,
-                             final_evidence=True,closed=True))
-    # If the only evidence is unreadable, keep one source per camera for a
-    # concurrent visit. If known identities coexist, unreadable text on the same
-    # passage is evidence of the container, not an additional container.
-    import re
-    is_live_rtsp = any(getattr(p, 'source_type', 'file') == 'rtsp' for p in group)
-    def _is_region_noise(r) -> bool:
-        if not r.best_any:
-            return True
-        raw_clean = re.sub(r'[^A-Z0-9]', '', (getattr(r.best_any[0], 'raw_text', '') or '').upper())
-        det_conf = getattr(r.best_any[1].detection, 'confidence', 0.0)
-        if det_conf < 0.65 and len(raw_clean) < 4:
-            return True
-        # On live RTSP streams, domestic closed-body trucks with painted slogans
-        # ('RIYA ROADLINES', 'SHAHID ROADLINES', 'LOGISTICS PVT', 'SV RL', 'MAERE', 'EE')
-        # have zero or 1 digit and are not shipping container numbers.
-        if is_live_rtsp and not r.context_only and sum(ch.isdigit() for ch in raw_clean) < 2:
-            return True
-        return False
-
-    is_noise_only = bool(unknown) and all(_is_region_noise(r) for _, r in unknown)
-    unknown_bundles = [unknown] if (not numbers and unknown and not is_noise_only and any(not p.capture_only for p,_ in unknown)) else []
-    for entries in unknown_bundles:
-        first = min((p for p,_ in entries),key=lambda p:(p.started,p.id))
-        key = ':'.join(sorted(p.id+':'+r.id for p,r in entries))
-        identity = str(uuid5(NAMESPACE_URL,'gate-unreadable:'+base+':'+key))
-        plans.append(replace(first,id=identity,regions=[r for _,r in entries],
-                             ambiguous=True,final_evidence=True,closed=True))
-    return plans
+    from app.events.capture_planner import plan_captures
+    return plan_captures(group, confirmations)

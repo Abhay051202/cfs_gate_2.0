@@ -1,13 +1,13 @@
 # Camera sources populate the per-slot dropdown. URLs stay in backend/.env.
 camera_sources:
   - id: poe-camera-1
-    name: PoE Camera 1 (IN Front/Top)
+    name: PoE Camera 1 (IN Rear)
     source_env: CAMERA_1_RTSP
   - id: poe-camera-2
-    name: PoE Camera 2 (IN Left)
+    name: PoE Camera 2 (IN Right)
     source_env: CAMERA_2_RTSP
   - id: poe-camera-3
-    name: PoE Camera 3 (IN Rear)
+    name: PoE Camera 3 (IN Left)
     source_env: CAMERA_3_RTSP
   - id: poe-camera-4
     name: PoE Camera 4 (OUT Front/Top)
@@ -20,33 +20,35 @@ camera_sources:
     source_env: CAMERA_6_RTSP
 
 # 3 cameras per gate:
-# 3 cameras configured for the IN gate (gate_id: lane-in): Front/Top, Left, Dedicated Rear
-# 3 cameras configured for the OUT gate (gate_id: lane-out): Front/Top, Left, Dedicated Rear
+# 3 cameras configured for the IN gate (gate_id: lane-in): Rear, Right, Left
+# 3 cameras configured for the OUT gate (gate_id: lane-out): Rear, Front/Approach
 cameras:
   # --- GATE IN (3 CAMERAS) ---
   - id: gate-in-1
-    name: Gate IN 1 (Front/Top)
+    name: Gate IN 1 (Rear)
     gate_id: lane-in
     source_env: CAMERA_1_RTSP
     direction: ENTRY
-    role: FRONT_TOP
+    role: REAR
     capture_fps: 10
-    occupancy_roi: [0.0, 0.0, 1.0, 1.0]
+    occupancy_roi: [0.04, 0.05, 0.65, 0.98]
   - id: gate-in-2
-    name: Gate IN 2 (Left)
+    name: Gate IN 2 (Right)
     gate_id: lane-in
     source_env: CAMERA_2_RTSP
     direction: ENTRY
-    role: LEFT
+    role: RIGHT
     capture_fps: 10
+    occupancy_roi: [0.05, 0.08, 0.96, 0.98]
   - id: gate-in-3
-    name: Gate IN 3 (Rear)
+    name: Gate IN 3 (Left)
     gate_id: lane-in
     source_env: CAMERA_3_RTSP
     direction: ENTRY
-    role: REAR
+    role: LEFT
     capture_fps: 10
     enabled: true
+    occupancy_roi: [0.28, 0.08, 0.98, 0.98]
 
   # --- GATE OUT (3 CAMERAS) ---
   - id: gate-out-1
@@ -56,7 +58,7 @@ cameras:
     direction: EXIT
     role: REAR
     capture_fps: 10
-    occupancy_roi: [0.0, 0.0, 1.0, 1.0]
+    occupancy_roi: [0.26, 0.05, 0.78, 0.96]
   - id: gate-out-2
     name: Gate OUT 2 (Front/Approach)
     gate_id: lane-out
@@ -64,7 +66,7 @@ cameras:
     direction: EXIT
     role: FRONT_TOP
     capture_fps: 10
-    occupancy_roi: [0.0, 0.0, 1.0, 1.0]
+    occupancy_roi: [0.20, 0.05, 0.82, 0.96]
   - id: gate-out-3
     name: Gate OUT 3 (Rear)
     gate_id: lane-out

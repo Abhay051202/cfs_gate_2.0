@@ -37,6 +37,7 @@ from app.events.cloud_dispatcher import (
     resolve_container_size,
 )
 from app.snapshots.proof import proof_jpeg
+from app.snapshots.outgoing_preview import OutgoingPreview
 
 log = logging.getLogger('gate.proof_updater')
 
@@ -127,6 +128,8 @@ class CloudProofUpgrader:
         """
         if not event_id:
             return
+        if getattr(self.settings, 'local_test_mode', False) is True:
+            return
         item = {
             'event_id': event_id,
             'candidate_image': candidate_image,
@@ -189,7 +192,8 @@ class CloudProofUpgrader:
 
         # Only already-synced events with a valid cloud_event_id receive PUT /images updates.
         # (Unsynced events will be dispatched via POST /events by normal dispatcher).
-        if not cloud_synced or not cloud_event_id:
+        coordinated = getattr(self.settings, 'proof_capture_enabled', False) is True
+        if not cloud_event_id or (not cloud_synced and not coordinated):
             return {
                 'success': False,
                 'status': 'NOT_ELIGIBLE',
@@ -199,6 +203,11 @@ class CloudProofUpgrader:
         session = self.session or (getattr(self.dispatcher, 'session', None) if self.dispatcher else None)
         if not session or not hasattr(session, 'put_gate_event_images'):
             return {'success': False, 'status': 'NO_SESSION', 'error': 'Cloud session with put_gate_event_images unavailable'}
+
+        if coordinated:
+            # Live OCR candidates cannot choose a new camera position. Only a
+            # persisted, approved revision is eligible for this PUT path.
+            return self._sync_approved_revision(event_record, session)
 
         # 1. Promote / store candidate image if provided
         if candidate_image is not None and camera_id and self.snapshots:
@@ -228,7 +237,7 @@ class CloudProofUpgrader:
 
         # 6. Execute PUT /api/v1/gate/events/{cloud_event_id}/images
         res = session.put_gate_event_images(cloud_event_id, payload)
-        if res in (True, 'CONFLICT') or isinstance(res, dict):
+        if res is True or (isinstance(res, dict) and res.get('success') is not False):
             new_version = int(event_record.get('proof_version', 1) or 1) + 1
             try:
                 self.repository.mark_cloud_synced(event_id, cloud_event_id=cloud_event_id, proof_version=new_version)
@@ -254,6 +263,49 @@ class CloudProofUpgrader:
         else:
             log.warning('prosper_cloud_proof_upgrade_rejected: %s', res, extra={'event_id': event_id, 'status': str(res)})
             return {'success': False, 'status': str(res), 'error': f'Cloud returned status: {res}'}
+
+    def _sync_approved_revision(self, event_record, session):
+        event_id = event_record['id']
+        if event_record.get('status') != 'CONFIRMED':
+            return {'success': False, 'status': 'NEEDS_REVIEW'}
+        store = OutgoingPreview(self.snapshots.root)
+        try:
+            payload = store.load(event_id)
+            if not payload or not payload.get('_proof_complete') or not payload.get('_overview', {}).get('frozen'):
+                return {'success': False, 'status': 'NO_APPROVED_PROOF'}
+            if self.dispatcher:
+                approved = self.dispatcher.build_event_payload(event_id)
+                if store.digest(approved) != store.digest(payload):
+                    raise ValueError('Proof revision changed during payload selection')
+        except (ValueError, OSError) as exc:
+            return {'success': False, 'status': 'PAYLOAD_ERROR', 'error': str(exc)}
+        version = int(payload.get('ProofVersion') or 1)
+        acknowledged = self.repository.get_acknowledged_proofs(event_id)
+        expected = {(c['ContainerNumber'], image['CameraId']): image['_image_hash']
+                    for c in payload['Containers'] for image in c['Images']}
+        actual = {(p['container_number'], p['camera_id']): p['image_hash'] for p in acknowledged}
+        if expected == actual and all(p.get('proof_version') == version for p in acknowledged):
+            self.repository.mark_cloud_synced(event_id, cloud_event_id=event_record['cloud_event_id'], proof_version=version)
+            return {'success': True, 'status': 'NOOP', 'proof_version': version}
+        # Never shrink or change the container/camera identities already shown
+        # by the cloud. A different event identity requires explicit handling.
+        if not actual.keys() <= expected.keys():
+            return {'success': False, 'status': 'PROOF_COVERAGE_REGRESSION'}
+        self.repository.mark_proof_pending(event_id, version)
+        result = session.put_gate_event_images(event_record['cloud_event_id'], payload)
+        if result is not True and not (isinstance(result, dict) and result.get('success') is not False):
+            return {'success': False, 'status': str(result)}
+        # Record precisely what the server accepted, even if another local
+        # revision was approved while this request was in flight.
+        self._record_payload_proofs(event_id, event_record['cloud_event_id'], payload, version)
+        current = store.load(event_id)
+        if not current or store.digest(current) != store.digest(payload):
+            if current:
+                self.repository.mark_proof_pending(event_id, int(current.get('ProofVersion') or version))
+            return {'success': True, 'status': 'NEWER_REVISION_PENDING', 'proof_version': version}
+        self.repository.mark_cloud_synced(event_id, cloud_event_id=event_record['cloud_event_id'], proof_version=version)
+        return {'success': True, 'status': 'UPGRADED', 'proof_version': version,
+                'cloud_event_id': event_record['cloud_event_id'], 'payload_sha256': store.digest(payload)}
 
     def _integrate_candidate_image(
         self,
@@ -459,6 +511,11 @@ class CloudProofUpgrader:
         cntr2 = event_record.get('container_number_2') or event_record.get('historical_container_number_2') or ''
         is_twin = bool(event_record.get('is_twin')) and bool(cntr2)
 
+        if getattr(self.settings, 'proof_capture_enabled', False) is True:
+            payload = OutgoingPreview(self.snapshots.root).load(event_record['id'])
+            if not payload or not payload.get('_proof_complete'):
+                raise ValueError('No complete approved proof revision')
+            return payload
         c1_dict = candidate_snapshots.get('c1', {})
         c2_dict = candidate_snapshots.get('c2', {})
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Literal
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 from app.snapshots.proof import proof_jpeg
 
 router = APIRouter(prefix='/api', tags=['events'])
@@ -59,15 +60,18 @@ def event(event_id: str, request: Request):
     if dispatcher:
         try:
             payload = dispatcher.build_proof_preview(event_id)
-            if result['local_test_mode']:
-                from app.snapshots.outgoing_preview import OutgoingPreview
-                result['proof_frozen'] = True
-                result['proof_payload_sha256'] = OutgoingPreview.digest(payload)
+            from app.snapshots.outgoing_preview import OutgoingPreview
+            result['proof_frozen'] = OutgoingPreview(request.app.state.snapshots.root).load(event_id) is not None
+            result['proof_payload_sha256'] = OutgoingPreview.digest(payload)
+            result['overview'] = payload.get('_overview')
+            if payload.get('_proof_reason'):
+                result['cloud_proof_error'] = payload['_proof_reason']
             for container in payload.get('Containers', []):
                 cameras = sorted({image.get('CameraId') for image in container.get('Images',[]) if image.get('CameraId')})
-                required = request.app.state.runtime.settings.minimum_number_proof_cameras if container.get('ContainerNumber') else 0
+                required = (len(payload['_overview']['required_cameras']) if payload.get('_overview') else
+                            (request.app.state.runtime.settings.minimum_number_proof_cameras if container.get('ContainerNumber') else 0))
                 result['cloud_proof_coverage'].append({'container_number':container.get('ContainerNumber'),
-                    'cameras':cameras,'required':required,'complete':len(cameras)>=required})
+                    'cameras':cameras,'required':required,'complete':len(cameras)>=required and payload.get('_proof_complete', True)})
                 for image in container.get('Images', []):
                     result['cloud_proof_images'].append({
                         'container_number': ('UNVERIFIED: ' + str(container.get('ContainerNumber') or '')) if result.get('ocr_acceptance', {}).get('accepted') is False else container.get('ContainerNumber'),
@@ -82,6 +86,10 @@ def event(event_id: str, request: Request):
             result['cloud_proof_error'] = str(exc)
     else:
         result['cloud_proof_error'] = 'Cloud proof preview is unavailable.'
+    if request.app.state.runtime.settings.proof_capture_enabled:
+        from app.snapshots.proof_revision import ProofRevision
+        result['proof_revision_candidates'] = ProofRevision(request.app.state.repository,
+            request.app.state.snapshots, request.app.state.runtime).candidates(event_id)
     return result
 
 
@@ -149,6 +157,21 @@ def event_json(event_id: str, request: Request):
         else:
             json_path = request.app.state.snapshots.save_event_json(event_id, result)
     return FileResponse(json_path, media_type='application/json', filename=f'event_{event_id}.json')
+
+
+class ProofRevisionRequest(BaseModel):
+    snapshot_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+@router.post('/gate-events/{event_id}/proof-revisions')
+def approve_proof_revision(event_id: str, body: ProofRevisionRequest, request: Request):
+    from app.snapshots.proof_revision import ProofRevision
+    try:
+        return ProofRevision(request.app.state.repository, request.app.state.snapshots,
+            request.app.state.runtime).approve(event_id, body.snapshot_id, body.reason)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(409, str(exc)) from None
 
 
 @router.post('/gate-events/{event_id}/upgrade-proofs')

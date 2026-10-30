@@ -50,7 +50,7 @@ class PaddleOCREngine:
         from pathlib import Path
         from rapidocr_onnxruntime import RapidOCR
         # Initialize RapidOCR with CPU fallback session
-        self.engine = RapidOCR(intra_op_num_threads=6, inter_op_num_threads=2)
+        self.engine = RapidOCR(det_limit_type='max', det_limit_side_len=960, intra_op_num_threads=4, inter_op_num_threads=1)
         
         # Accelerate with TensorRT GPU engines if available
         use_gpu = getattr(settings, 'ocr_gpu', True)
@@ -89,7 +89,7 @@ class PaddleOCREngine:
         if image is None or getattr(image, 'size', 0) == 0:
             return OCRRead('', 0.0)
         with self._lock:
-            from app.ocr.validator import ContainerValidator, repair_container_candidate
+            from app.ocr.validator import ContainerValidator, repair_container_candidate, extract_iso_size_code
             validator = ContainerValidator()
 
             def _check_or_repair(txt: str, conf: float):
@@ -98,36 +98,189 @@ class PaddleOCREngine:
                 v = validator.validate(OCRRead(txt, conf))
                 if v.valid_check_digit:
                     return txt, conf, True
-                # Keep the actual observed text. Checksum repairs can propose a
-                # different identifier but must never become observed evidence.
+                if conf >= 0.65:
+                    repaired = repair_container_candidate(txt, v.normalized_text)
+                    if repaired:
+                        iso_code, _ = extract_iso_size_code(txt)
+                        combined_repaired = f"{repaired} {iso_code}" if iso_code else repaired
+                        rv = validator.validate(OCRRead(combined_repaired, conf))
+                        if rv.valid_check_digit:
+                            return combined_repaired, conf, True
                 return txt, conf, False
 
-            # 1. Fast path: Direct crop recognition without sub-detection (~35ms)
-            res_rec, _ = self.engine(image, use_det=False)
-            best_txt, best_conf = '', 0.0
-            if res_rec and res_rec[0]:
-                raw_txt = str(res_rec[0][0] or '').strip()
-                conf = float(res_rec[0][1] or 0.0)
-                final_txt, final_conf, is_valid = _check_or_repair(raw_txt, conf)
-                if is_valid:
-                    return OCRRead(final_txt, final_conf)
-                best_txt, best_conf = final_txt, final_conf
-
-            # 2. Check vertical crops: direct 90-degree rotations first, then upright glyph reassembly fallback
             h, w = image.shape[:2]
+            best_txt, best_conf = '', 0.0
+
+            # 1. Fast path for horizontal/square crops: Direct crop recognition without sub-detection (~15ms)
+            if h <= 2.0 * w:
+                res_rec, _ = self.engine(image, use_det=False)
+                if res_rec and res_rec[0]:
+                    raw_txt = str(res_rec[0][0] or '').strip()
+                    conf = float(res_rec[0][1] or 0.0)
+                    final_txt, final_conf, is_valid = _check_or_repair(raw_txt, conf)
+                    if is_valid:
+                        return OCRRead(final_txt, final_conf)
+                    best_txt, best_conf = final_txt, final_conf
+
+            # 2. Check vertical crops: upright glyph reassembly first (~25ms), then dark-glyph strips, then 90-deg rotations
             if h > 1.25 * w:
                 import cv2
                 import numpy as np
+                from app.ocr.container_ocr import vertical_glyph_column, rectify_printed_digit_box, stacked_number_strips
+                from app.ocr.validator import extract_iso_size_code
 
-                # 2a. Direct 90-degree rotations (native horizontal reading preserves glyph shapes & spacing)
-                crop_variants = [image]
+                # 2a. Upright stacked characters: contour thresholding & glyph reassembly
                 if h > 2.0 * w:
-                    if int(0.06 * h) >= 4:
-                        crop_variants.append(image[int(0.06 * h):int(0.96 * h), :])
-                    # Trim top latch/hinge bolt (4.5%) and bottom warning triangle/hazmat decal (12%)
-                    if int(0.12 * h) >= 6:
-                        crop_variants.append(image[int(0.045 * h):int(0.88 * h), :])
-                        crop_variants.append(image[:int(0.88 * h), :])
+                    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+                    # Test both light-on-dark (gray) and dark-on-light (255 - gray)
+                    for src_polarity in (gray, 255 - gray):
+                        # Robust vertical alignment with missing thin digit interpolation (e.g. MSC MEDU7105686)
+                        for th in (120, 100, 80, 140):
+                            _, mask = cv2.threshold(src_polarity, th, 255, cv2.THRESH_BINARY)
+                            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            raw_boxes = sorted(
+                                [cv2.boundingRect(c) for c in contours if 0.025 * h <= cv2.boundingRect(c)[3] <= 0.14 * h and 4 <= cv2.boundingRect(c)[2] <= 0.85 * w],
+                                key=lambda b: b[1],
+                            )
+                            for a in raw_boxes:
+                                ax, ay = a[0] + a[2] / 2, a[1] + a[3] / 2
+                                for b in raw_boxes:
+                                    bx, by = b[0] + b[2] / 2, b[1] + b[3] / 2
+                                    if by - ay < 0.55 * h:
+                                        continue
+                                    slope = (bx - ax) / (by - ay)
+                                    if abs(slope) > 0.4:
+                                        continue
+                                    column = sorted(
+                                        [z for z in raw_boxes if abs(z[0] + z[2] / 2 - (ax + slope * (z[1] + z[3] / 2 - ay))) < max(6, z[2] * 0.6)],
+                                        key=lambda z: z[1]
+                                    )
+                                    dedup = []
+                                    for z in column:
+                                        if dedup and z[1] < dedup[-1][1] + dedup[-1][3] * 0.7:
+                                            prev = dedup.pop()
+                                            ny1 = min(prev[1], z[1])
+                                            ny2 = max(prev[1] + prev[3], z[1] + z[3])
+                                            nx1 = min(prev[0], z[0])
+                                            nx2 = max(prev[0] + prev[2], z[0] + z[2])
+                                            dedup.append((nx1, ny1, nx2 - nx1, ny2 - ny1))
+                                        else:
+                                            dedup.append(z)
+
+                                    if len(dedup) == 10:
+                                        med_h = float(np.median([z[3] for z in dedup]))
+                                        for idx in range(len(dedup) - 1):
+                                            gap = dedup[idx + 1][1] - (dedup[idx][1] + dedup[idx][3])
+                                            if gap >= 0.7 * med_h:
+                                                missing_y = int(dedup[idx][1] + dedup[idx][3] + (gap - med_h) / 2)
+                                                missing_x = int(dedup[idx][0] + slope * (missing_y - dedup[idx][1]))
+                                                missing_w = int(np.median([z[2] for z in dedup]))
+                                                dedup.insert(idx + 1, (missing_x, missing_y, missing_w, int(med_h)))
+                                                break
+
+                                    if len(dedup) == 11:
+                                        pieces = []
+                                        for idx, (bx, by, bw, bh) in enumerate(dedup):
+                                            part = image[max(0, by - 2):min(h, by + bh + 2), max(0, bx - 2):min(w, bx + bw + 2)]
+                                            if part.size == 0:
+                                                continue
+                                            if idx == len(dedup) - 1:
+                                                unboxed = rectify_printed_digit_box(part)
+                                                if unboxed is not None and unboxed.size > 0:
+                                                    part = unboxed
+                                            target_w = max(18, int(48 * part.shape[1] / max(1, part.shape[0])))
+                                            resized = cv2.resize(part, (target_w, 48), interpolation=cv2.INTER_CUBIC)
+                                            pieces.append(cv2.copyMakeBorder(resized, 6, 6, 4, 4, cv2.BORDER_CONSTANT, value=(180, 180, 180)))
+                                        if len(pieces) == 11:
+                                            line_img = np.concatenate(pieces, axis=1)
+                                            v_res, _ = self.engine(line_img, use_det=False)
+                                            if v_res and v_res[0]:
+                                                v_txt = str(v_res[0][0] or '').strip()
+                                                v_conf = float(v_res[0][1] or 0.0)
+                                                final_txt, final_conf, is_valid = _check_or_repair(v_txt, v_conf)
+                                                if is_valid:
+                                                    return OCRRead(final_txt, final_conf)
+                                                if v_conf > best_conf:
+                                                    best_txt, best_conf = final_txt, final_conf
+
+                        # Standard column detection
+                        for thresh_val in (140, 115, 0):
+                            if thresh_val == 0:
+                                _, mask = cv2.threshold(src_polarity, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                            else:
+                                mask = ((src_polarity > thresh_val).astype(np.uint8)) * 255
+                            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            raw_boxes = sorted(
+                                [cv2.boundingRect(c) for c in contours if 0.025 * h < cv2.boundingRect(c)[3] < 0.16 * h and 3 <= cv2.boundingRect(c)[2] <= 0.85 * w],
+                                key=lambda b: b[1],
+                            )
+                            merged = []
+                            for x, y, bw, bh in raw_boxes:
+                                matched_idx = None
+                                for idx in range(len(merged) - 1, -1, -1):
+                                    px, py, pw, ph = merged[idx]
+                                    y_overlap = y < py + ph * 0.80 and py < y + bh * 0.80
+                                    x_dist = max(0, max(px, x) - min(px + pw, x + bw))
+                                    if y_overlap and x_dist <= max(6, 0.18 * w):
+                                        matched_idx = idx
+                                        break
+                                if matched_idx is not None:
+                                    px, py, pw, ph = merged[matched_idx]
+                                    lx, ty = min(px, x), min(py, y)
+                                    merged[matched_idx] = (lx, ty, max(px + pw, x + bw) - lx, max(py + ph, y + bh) - ty)
+                                else:
+                                    merged.append((x, y, bw, bh))
+                            merged.sort(key=lambda b: b[1])
+                            col = vertical_glyph_column(merged, h)
+                            if col is not None:
+                                merged = col
+                            elif len(merged) > 11:
+                                med_h = float(np.median([b[3] for b in merged]))
+                                filtered = [b for b in merged if 0.65 * med_h <= b[3] <= 1.6 * med_h]
+                                col2 = vertical_glyph_column(filtered, h)
+                                if col2 is not None:
+                                    merged = col2
+                                elif 10 <= len(filtered) <= 13:
+                                    merged = filtered
+                            if 10 <= len(merged) <= 13:
+                                pieces = []
+                                for idx, (x, y, bw, bh) in enumerate(merged):
+                                    part = image[max(0, y - 2):min(h, y + bh + 2), max(0, x - 2):min(w, x + bw + 2)]
+                                    if part.size == 0:
+                                        continue
+                                    if idx == len(merged) - 1:
+                                        unboxed = rectify_printed_digit_box(part)
+                                        if unboxed is not None and unboxed.size > 0:
+                                            part = unboxed
+                                    target_w = max(18, int(48 * part.shape[1] / max(1, part.shape[0])))
+                                    resized = cv2.resize(part, (target_w, 48), interpolation=cv2.INTER_CUBIC)
+                                    pieces.append(cv2.copyMakeBorder(resized, 6, 6, 4, 4, cv2.BORDER_CONSTANT, value=(60, 60, 60)))
+                                if pieces:
+                                    line_img = np.concatenate(pieces, axis=1)
+                                    v_res, _ = self.engine(line_img, use_det=False)
+                                    if v_res and v_res[0]:
+                                        v_txt = str(v_res[0][0] or '').strip()
+                                        v_conf = float(v_res[0][1] or 0.0)
+                                        final_txt, final_conf, is_valid = _check_or_repair(v_txt, v_conf)
+                                        if is_valid:
+                                            return OCRRead(final_txt, final_conf)
+                                        if v_conf > best_conf:
+                                            best_txt, best_conf = final_txt, final_conf
+
+                    for strip in stacked_number_strips(image):
+                        result, _ = self.engine(strip, use_det=False)
+                        if result and result[0]:
+                            text, confidence = str(result[0][0] or '').strip(), float(result[0][1] or 0)
+                            final_txt, final_conf, valid = _check_or_repair(text, confidence)
+                            if valid:
+                                return OCRRead(final_txt, final_conf)
+                            if len(final_txt) > len(best_txt):
+                                best_txt, best_conf = final_txt, final_conf
+
+                # 2b. Direct 90-degree rotations (for sideways/rotated vertical markings)
+                crop_variants = [image]
+                if h > 2.0 * w and int(0.12 * h) >= 6:
+                    crop_variants.append(image[int(0.045 * h):int(0.88 * h), :])
                 for src_crop in crop_variants:
                     for rot in (cv2.ROTATE_90_COUNTERCLOCKWISE, cv2.ROTATE_90_CLOCKWISE):
                         rot_img = cv2.rotate(src_crop, rot)
@@ -139,90 +292,105 @@ class PaddleOCREngine:
                             final_txt, final_conf, is_valid = _check_or_repair(r_txt, r_conf)
                             if is_valid and len(final_txt) == 11 and final_txt[3] == 'U' and (direct_v.valid_check_digit or r_conf >= 0.72):
                                 return OCRRead(final_txt, final_conf)
+                            if r_conf >= 0.85 and extract_iso_size_code(r_txt)[0]:
+                                return OCRRead(r_txt, r_conf)
                             if r_conf > best_conf and (not best_txt or len(r_txt) >= len(best_txt)):
                                 best_txt, best_conf = final_txt, final_conf
 
-                # 2b. Fallback for upright stacked characters: contour thresholding & glyph reassembly
-                if h > 2.0 * w:
-                    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-                    for thresh_val in (0, 140, 115):
-                        if thresh_val == 0:
-                            _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-                        else:
-                            mask = ((gray > thresh_val).astype(np.uint8)) * 255
-                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        raw_boxes = sorted(
-                            [cv2.boundingRect(c) for c in contours if 0.025 * h < cv2.boundingRect(c)[3] < 0.16 * h and 3 <= cv2.boundingRect(c)[2] <= w],
-                            key=lambda b: b[1],
-                        )
-                        merged = []
-                        for x, y, bw, bh in raw_boxes:
-                            if merged and y < merged[-1][1] + merged[-1][3] * 0.75:
-                                px, py, pw, ph = merged.pop()
-                                lx, ty = min(px, x), min(py, y)
-                                merged.append((lx, ty, max(px + pw, x + bw) - lx, max(py + ph, y + bh) - ty))
-                            else:
-                                merged.append((x, y, bw, bh))
-                        if 10 <= len(merged) <= 13:
-                            pieces = []
-                            for idx, (x, y, bw, bh) in enumerate(merged):
-                                part = image[max(0, y - 2):min(h, y + bh + 2), max(0, x - 2):min(w, x + bw + 2)]
-                                if part.size == 0:
-                                    continue
-                                target_w = max(18, int(48 * part.shape[1] / max(1, part.shape[0])))
-                                resized = cv2.resize(part, (target_w, 48), interpolation=cv2.INTER_CUBIC)
-                                pieces.append(cv2.copyMakeBorder(resized, 6, 6, 4, 4, cv2.BORDER_CONSTANT, value=(60, 60, 60)))
-                            if pieces:
-                                line_img = np.concatenate(pieces, axis=1)
-                                v_res, _ = self.engine(line_img, use_det=False)
-                                if v_res and v_res[0]:
-                                    v_txt = str(v_res[0][0] or '').strip()
-                                    v_conf = float(v_res[0][1] or 0.0)
-                                    final_txt, final_conf, is_valid = _check_or_repair(v_txt, v_conf)
-                                    if is_valid:
-                                        return OCRRead(final_txt, final_conf)
-                                    if v_conf > best_conf:
-                                        best_txt, best_conf = final_txt, final_conf
+            # 3. Fallback: Full text detection + recognition (skip on narrow single-char vertical strips)
+            if h <= 2.5 * w:
+                res_det, _ = self.engine(image, use_det=True)
+                if res_det:
+                    txt, conf = _extract_text_from_items(res_det)
+                    final_txt, final_conf, is_valid = _check_or_repair(txt, conf)
+                    if is_valid:
+                        return OCRRead(final_txt, final_conf)
+                    if conf > best_conf or len(txt) > len(best_txt):
+                        best_txt, best_conf = final_txt, final_conf
 
-            # 3. Fallback: Full text detection + recognition
-            res_det, _ = self.engine(image, use_det=True)
-            if res_det:
-                txt, conf = _extract_text_from_items(res_det)
-                final_txt, final_conf, is_valid = _check_or_repair(txt, conf)
-                if is_valid:
-                    return OCRRead(final_txt, final_conf)
-                if conf > best_conf or len(txt) > len(best_txt):
-                    best_txt, best_conf = final_txt, final_conf
-
-            # 4. Contrast-enhanced CLAHE fallback when raw crop did not yield a valid check digit
-            try:
-                from app.ocr.container_ocr import prepare_ocr_crop
-                enhanced = prepare_ocr_crop(image)
-                if enhanced is not None and enhanced is not image:
-                    enh_rec, _ = self.engine(enhanced, use_det=False)
-                    if enh_rec and enh_rec[0]:
-                        e_txt = str(enh_rec[0][0] or '').strip()
-                        e_conf = float(enh_rec[0][1] or 0.0)
-                        final_txt, final_conf, is_valid = _check_or_repair(e_txt, e_conf)
-                        if is_valid:
-                            return OCRRead(final_txt, final_conf)
-                        if e_conf > best_conf:
-                            best_txt, best_conf = final_txt, final_conf
-            except Exception:
-                pass
+            # 4. Contrast-enhanced CLAHE fallback on horizontal/square crops
+            if h <= 2.0 * w:
+                try:
+                    from app.ocr.container_ocr import prepare_ocr_crop
+                    enhanced = prepare_ocr_crop(image)
+                    if enhanced is not None and enhanced is not image:
+                        enh_rec, _ = self.engine(enhanced, use_det=False)
+                        if enh_rec and enh_rec[0]:
+                            e_txt = str(enh_rec[0][0] or '').strip()
+                            e_conf = float(enh_rec[0][1] or 0.0)
+                            final_txt, final_conf, is_valid = _check_or_repair(e_txt, e_conf)
+                            if is_valid:
+                                return OCRRead(final_txt, final_conf)
+                            if e_conf > best_conf:
+                                best_txt, best_conf = final_txt, final_conf
+                except Exception:
+                    pass
 
             return OCRRead(best_txt, best_conf)
 
     def read_iso(self, image) -> OCRRead:
+        if image is None or getattr(image, 'size', 0) == 0:
+            return OCRRead('', 0.0)
         import re
+        import cv2
+        import numpy as np
         from app.ocr.validator import extract_iso_size_code
-        result = self.read(image)
-        code, _ = extract_iso_size_code(result.raw_text)
-        if code:
-            return OCRRead(code, result.confidence)
-        compact = re.sub(r'[^A-Z0-9]', '', (result.raw_text or '').upper())
-        match = re.search(r'(?<![A-Z0-9])([1-4LMN][0-9][GVRHBUTP][0-9A-Z])(?![A-Z0-9])', compact)
-        return OCRRead(match.group(1) if match else '', result.confidence if match else 0.0)
+        with self._lock:
+            def _match_iso(txt: str, conf: float):
+                if not txt:
+                    return None
+                code, _ = extract_iso_size_code(txt)
+                if code:
+                    return OCRRead(code, conf)
+                compact = re.sub(r'[^A-Z0-9]', '', txt.upper())
+                m = re.search(r'(?<![A-Z0-9])([1-4LMN][0-9][GVRHBUTP][0-9A-Z])(?![A-Z0-9])', compact)
+                if m:
+                    return OCRRead(m.group(1), conf)
+                return None
+
+            # 1. Fast direct recognition (~12ms)
+            res_rec, _ = self.engine(image, use_det=False)
+            if res_rec and res_rec[0]:
+                raw_txt = str(res_rec[0][0] or '').strip()
+                conf = float(res_rec[0][1] or 0.0)
+                hit = _match_iso(raw_txt, conf)
+                if hit:
+                    return hit
+
+            # 2. Vertical stacked 4-char ISO markings (e.g. gate-in-1 / gate-out-1 vertical stencil)
+            h, w = image.shape[:2]
+            if h > 1.5 * w:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+                _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                boxes = sorted(
+                    [cv2.boundingRect(c) for c in contours if 0.05 * h < cv2.boundingRect(c)[3] < 0.40 * h and 3 <= cv2.boundingRect(c)[2] <= 0.90 * w],
+                    key=lambda b: b[1],
+                )
+                if 3 <= len(boxes) <= 8:
+                    pieces = []
+                    for x, y, bw, bh in boxes:
+                        part = image[max(0, y - 2):min(h, y + bh + 2), max(0, x - 2):min(w, x + bw + 2)]
+                        if part.size == 0:
+                            continue
+                        tw = max(18, int(48 * part.shape[1] / max(1, part.shape[0])))
+                        pieces.append(cv2.copyMakeBorder(cv2.resize(part, (tw, 48)), 6, 6, 4, 4, cv2.BORDER_CONSTANT, value=(60, 60, 60)))
+                    if pieces:
+                        v_res, _ = self.engine(np.concatenate(pieces, axis=1), use_det=False)
+                        if v_res and v_res[0]:
+                            hit = _match_iso(str(v_res[0][0] or '').strip(), float(v_res[0][1] or 0.0))
+                            if hit:
+                                return hit
+
+            # 3. Single detection pass for multi-word plates (e.g. '136826 22G1')
+            if h <= 2.5 * w:
+                res_det, _ = self.engine(image, use_det=True)
+                if res_det:
+                    txt, conf = _extract_text_from_items(res_det)
+                    hit = _match_iso(txt, conf)
+                    if hit:
+                        return hit
+            return OCRRead('', 0.0)
 
     def close(self):
         pass
@@ -781,16 +949,37 @@ class OlmOCREngine:
         return self.read(image, target='iso')
 
 
+class ThreadLocalOCREngine:
+    """Thread-isolated OCR engine wrapper to enable concurrent multi-worker inference."""
+    def __init__(self, factory):
+        self._factory = factory
+        self._local = threading.local()
+
+    @property
+    def current(self):
+        if not hasattr(self._local, 'engine'):
+            self._local.engine = self._factory()
+        return self._local.engine
+
+    def read(self, image):
+        return self.current.read(image)
+
+    def read_iso(self, image):
+        return self.current.read_iso(image)
+
+
 def create_ocr_engine(settings) -> OCREngine:
     engine_type = getattr(settings, 'ocr_engine', 'easyocr').lower()
     if engine_type in ('paddleocr', 'paddle', 'ppocr'):
-        primary = PaddleOCREngine(settings)
-        fallback_engine = getattr(settings, 'ocr_fallback_engine', 'none').lower()
-        if fallback_engine in ('olmocr', 'qwen2_vl', 'qwen2vl', 'qwen'):
-            return FallbackOCREngine(primary, lambda: OlmOCREngine(settings))
-        if fallback_engine == 'easyocr':
-            return FallbackOCREngine(primary, lambda: EasyOCREngine(settings))
-        return primary
+        def _factory():
+            primary = PaddleOCREngine(settings)
+            fallback_engine = getattr(settings, 'ocr_fallback_engine', 'none').lower()
+            if fallback_engine in ('olmocr', 'qwen2_vl', 'qwen2vl', 'qwen'):
+                return FallbackOCREngine(primary, lambda: OlmOCREngine(settings))
+            if fallback_engine == 'easyocr':
+                return FallbackOCREngine(primary, lambda: EasyOCREngine(settings))
+            return primary
+        return ThreadLocalOCREngine(_factory)
     if engine_type in ('olmocr', 'qwen2_vl', 'qwen2vl', 'qwen'):
         return OlmOCREngine(settings)
     return EasyOCREngine(settings)

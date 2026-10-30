@@ -13,7 +13,7 @@ from app.snapshots.snapshot_manager import SnapshotManager
 def settings(tmp_path):
     return Settings(_env_file=None, deployment_mode='test', database_url='sqlite+pysqlite:///' + str(tmp_path / 'test.db'),
                     snapshot_directory=tmp_path / 'snapshots', categorized_snapshot_folders=False, pipeline_enabled=False, vehicle_visit_tracking=False, minimum_number_proof_cameras=1, shared_visit_folders=False, container_roi_trigger=False,
-                    reversal_grace_seconds=0,
+                    reversal_grace_seconds=0, strict_ocr_acceptance=False, proof_capture_enabled=False, visit_capture_enabled=False,
                     upload_directory=tmp_path / 'uploads',
                     ocr_interval_seconds=.001, reconnect_initial_seconds=.01, reconnect_max_seconds=.02)
 

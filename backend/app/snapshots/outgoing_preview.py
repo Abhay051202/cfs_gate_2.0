@@ -54,7 +54,7 @@ class OutgoingPreview:
                 temp.unlink(missing_ok=True)
             return self.load(event_id)
 
-    def revise_camera(self, event_id, camera_id, jpeg, captured_at, source_path, reason):
+    def revise_camera(self, event_id, camera_id, jpeg, captured_at, source_path, reason, expected_digest=None):
         """Explicit reviewed revision; automatic refreshes still cannot change proof.
 
         Preserve the prior envelope and change only this camera's encoded image.
@@ -66,17 +66,39 @@ class OutgoingPreview:
             previous = self.load(event_id)
             if previous is None:
                 raise ValueError('No frozen preview to revise')
+            if expected_digest is not None and self.digest(previous) != expected_digest:
+                raise ValueError('Proof changed during review; refresh before approving')
             updated = deepcopy(previous)
             matches = [image for container in updated.get('Containers', [])
                        for image in container.get('Images', []) if image.get('CameraId') == camera_id]
-            if len(matches) != 1:
+            coordinated = bool(previous.get('_overview'))
+            if coordinated:
+                overview = previous['_overview']
+                if not previous.get('_proof_complete') or not overview.get('frozen'):
+                    raise ValueError('Only a complete fixed-position proof can be revised')
+                trigger = datetime.fromisoformat(overview['trigger_at'].replace('Z', '+00:00'))
+                captured = datetime.fromisoformat(captured_at.replace('Z', '+00:00'))
+                tolerance = overview.get('sync_tolerance_seconds', .3)
+                if abs((captured-trigger).total_seconds()) > tolerance:
+                    raise ValueError('Replacement is outside the fixed capture time')
+                visit = previous.get('_source_visit_id') or overview.get('visit_id')
+                if not visit or visit not in Path(source_path).parts:
+                    raise ValueError('Replacement belongs to another visit')
+                if len({i.get('Image') for i in matches}) > 1:
+                    raise ValueError('Camera has different source images across containers')
+                times = [datetime.fromisoformat(i['CapturedAt'].replace('Z', '+00:00'))
+                         for c in updated['Containers'] for i in c['Images'] if i['CameraId'] != camera_id] + [captured]
+                if (max(times)-min(times)).total_seconds() > tolerance:
+                    raise ValueError('Replacement would break camera synchronization')
+            if not matches or (not coordinated and len(matches) != 1):
                 raise ValueError('Review one unambiguous container/camera proof at a time')
             revision = int(updated.get('ProofVersion') or 1) + 1
             image = matches[0]
             old_hash = image.get('_image_hash')
-            image.update(Image='data:image/jpeg;base64,' + base64.b64encode(jpeg).decode(),
-                         CapturedAt=captured_at, _image_path=source_path,
-                         _image_hash=hashlib.sha256(jpeg).hexdigest())
+            for image in matches:
+                image.update(Image='data:image/jpeg;base64,' + base64.b64encode(jpeg).decode(),
+                             CapturedAt=captured_at, _image_path=source_path,
+                             _image_hash=hashlib.sha256(jpeg).hexdigest())
             updated['ProofVersion'] = revision
             updated.setdefault('_local_proof_revisions', []).append({
                 'camera_id': camera_id, 'reason': reason, 'previous_image_hash': old_hash,

@@ -17,7 +17,7 @@ export interface Camera {
   passage_tracking?: {state: string; passages: {event_id: string; lane_id: string; closed: boolean; candidates: number}[]};
 }
 export interface LaneRegion { id: string; polygon: number[][]; }
-export interface LaneCalibration { camera_id: string; occupancy_roi: number[]; lanes?: LaneRegion[]; entry_line: number; exit_line: number; gate_exit_axis: 'x' | 'y' | null; gate_exit_positive: boolean; gate_clear_seconds?: number; version: number; }
+export interface LaneCalibration { camera_id: string; occupancy_roi: number[]; lanes?: LaneRegion[]; entry_line: number; exit_line: number; gate_exit_axis: 'x' | 'y' | null; gate_exit_positive: boolean; proof_capture_axis?: 'x' | 'y' | null; proof_capture_position?: number; proof_capture_positive?: boolean; gate_clear_seconds?: number; version: number; }
 export interface CameraSource { id: string; name: string; host?: string; configured: boolean; discovered?: boolean; connection_hint?: string; }
 export interface DiscoveryStatus { state: string; found: number; message: string; }
 export interface WaitingCandidate {
@@ -74,6 +74,8 @@ export interface OcrCrop { id: string; camera_id?: string; timestamp?: string; s
 export interface EventDetail extends GateEvent {
   local_test_mode?: boolean;
   proof_frozen?: boolean;
+  proof_revision_candidates?: {snapshot_id: string; camera_id: string; captured_at: string; quality: number}[];
+  overview?: { state: string; mode: string; reference_camera_id: string; trigger_at: string; missing_cameras: string[]; unverified_cameras: string[]; required_cameras: string[] };
   proof_payload_sha256?: string | null;
   cloud_proof_complete?: boolean;
   cloud_proof_coverage?: {container_number: string | null; cameras: string[]; required: number; complete: boolean}[];
@@ -169,6 +171,10 @@ export class GateApi {
     return this.http.get<{items: WaitingPassage[]; total: number}>('/api/waiting-passages');
   }
   event(id: string) { return this.http.get<EventDetail>(`/api/gate-events/${encodeURIComponent(id)}`); }
+  approveProofRevision(id: string, snapshotId: string) {
+    return this.http.post<{success: boolean; proof_version: number; message: string}>(`/api/gate-events/${encodeURIComponent(id)}/proof-revisions`,
+      {snapshot_id: snapshotId, reason: 'Operator reviewed and selected a clearer frame at the fixed capture position'});
+  }
   eventJsonUrl(id: string) { return `/api/gate-events/${encodeURIComponent(id)}/json`; }
   eventJson(id: string) { return this.http.get<Record<string, unknown>>(`/api/gate-events/${encodeURIComponent(id)}/json`); }
 

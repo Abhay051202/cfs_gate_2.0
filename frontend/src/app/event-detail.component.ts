@@ -260,12 +260,18 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
                 <h3>{{ item.local_test_mode ? 'Local preview · images prepared for upload' : 'Cloud upload proof' }}</h3>
                 <span class="badge">{{ item.cloud_proof_images?.length || 0 }} images</span>
               </div>
-              <p class="image-refresh-note">{{ item.proof_frozen ? 'Frozen images from the saved upload payload. No data has been sent during this local test.' : 'Images selected by the upload builder. Preview only; no data is sent by viewing this page.' }}</p>
+              <p class="image-refresh-note">{{ item.proof_frozen ? 'Frozen proof: these exact images are used by the upload payload.' : 'Proof preview only. Viewing these images does not send data.' }}</p>
+              @if (item.overview) {
+                <p class="image-refresh-note">Overview: {{ item.overview.state }} · {{ item.overview.mode === 'CAPTURE_LINE' ? 'Fixed capture position' : 'Maximum visibility fallback — position not calibrated' }} · Reference {{ item.overview.reference_camera_id }}.</p>
+              }
+              @if (item.cloud_proof_error) {
+                <p class="review-explanation" role="status">{{ item.cloud_proof_error }}</p>
+              }
               @for (coverage of item.cloud_proof_coverage || []; track $index) {
                 @if (coverage.required > 0) {
                   <p class="image-refresh-note" [class.review-explanation]="!coverage.complete">
-                    {{ coverage.container_number }}: number proof from {{ coverage.cameras.length }} of {{ coverage.required }} required cameras.
-                    @if (!coverage.complete) { Sending is held until a second camera provides matching number proof. }
+                    {{ coverage.container_number }}: overview images from {{ coverage.cameras.length }} of {{ coverage.required }} required cameras.
+                    @if (!coverage.complete) { Sending is held until proof validation is complete. }
                   </p>
                 }
               }
@@ -278,9 +284,19 @@ import { EventDetail, GateApi, OcrCrop } from './gate-api.service';
                   <div class="proof-img-wrap"><img [src]="proof.image" [alt]="'Cloud upload proof for ' + proof.container_number + ' from ' + proof.camera_id"></div>
                   <figcaption class="proof-caption">{{ proof.captured_at | date:'HH:mm:ss · dd MMM yyyy' }}</figcaption>
                 </figure>
+                @for (candidate of item.proof_revision_candidates || []; track candidate.snapshot_id) {
+                  @if (candidate.camera_id === proof.camera_id) {
+                    <details class="primary-proof-card">
+                      <summary>Review clearer frame · {{ candidate.captured_at | date:'HH:mm:ss.SSS' }}</summary>
+                      <img [src]="rawSnapshotUrl(candidate.snapshot_id)" alt="Full-frame proof replacement for review" style="width:100%;height:auto">
+                      <button type="button" [disabled]="revisionBusy()" (click)="approveProof(item, candidate.snapshot_id)">Use this frame in the proof revision</button>
+                    </details>
+                  }
+                }
               } @empty {
                 <p class="review-explanation" role="status">{{ item.cloud_proof_error || 'No usable cloud proof images are available.' }}</p>
               }
+              @if (revisionMessage()) { <p class="image-refresh-note" role="status">{{ revisionMessage() }}</p> }
             </div>
           </div>
         </div>
@@ -305,6 +321,19 @@ export class EventDetailComponent {
   }
 
   dispatching = signal(false);
+  revisionBusy = signal(false);
+  revisionMessage = signal<string | null>(null);
+  approveProof(item: EventDetail, snapshotId: string) {
+    if (this.revisionBusy()) return;
+    this.revisionBusy.set(true);
+    this.gateApi.approveProofRevision(item.id, snapshotId).subscribe({
+      next: result => {
+        this.revisionMessage.set(result.message);
+        this.gateApi.event(item.id).subscribe({next: updated => {Object.assign(item, updated); this.revisionBusy.set(false);}, error: () => this.revisionBusy.set(false)});
+      },
+      error: error => {this.revisionMessage.set(error?.error?.detail || 'Proof revision could not be approved'); this.revisionBusy.set(false);}
+    });
+  }
   dispatchSuccess = signal(false);
   dispatchMessage = signal<string | null>(null);
 

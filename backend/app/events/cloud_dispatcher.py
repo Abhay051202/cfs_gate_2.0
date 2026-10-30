@@ -166,9 +166,10 @@ def sanitize_payload_for_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def resolve_camera_image_type(camera_id: str, camera_configs: Optional[dict] = None) -> str:
-    """Map camera ID or role to FRONT or REAR.
-    gate-out-1 / gate-in-3 are REAR container door cameras.
-    gate-out-2 / gate-in-1 / gate-in-2 are FRONT / cabin / approaching cameras.
+    """Map camera ID or role to FRONT, REAR, or SIDE.
+    gate-in-1 / gate-out-1 are REAR container door cameras.
+    gate-in-2 / gate-in-3 are SIDE (right/left) container cameras.
+    gate-out-2 is FRONT / approaching camera.
     """
     c = (camera_id or '').lower()
     if camera_configs and camera_id in camera_configs:
@@ -178,8 +179,12 @@ def resolve_camera_image_type(camera_id: str, camera_configs: Optional[dict] = N
             return 'REAR'
         if 'FRONT' in role or 'CABIN' in role or 'TOP' in role:
             return 'FRONT'
-    if 'out-1' in c or 'in-3' in c or any(k in c for k in ('rear', 'back', '-3')):
+        if 'LEFT' in role or 'RIGHT' in role or 'SIDE' in role:
+            return 'SIDE'
+    if 'out-1' in c or 'in-1' in c or any(k in c for k in ('rear', 'back')):
         return 'REAR'
+    if 'in-2' in c or 'in-3' in c or any(k in c for k in ('left', 'right', 'side')):
+        return 'SIDE'
     return 'FRONT'
 
 
@@ -585,21 +590,30 @@ class ProsperSession:
         put_containers = []
         for c in payload.get('Containers', []):
             put_images = []
+            seen_cameras = set()
             for img in c.get('Images', []):
+                camera = img.get('CameraId')
+                if not camera or camera in seen_cameras or not img.get('Image'):
+                    return 'REJECTED'
+                seen_cameras.add(camera)
                 put_images.append({
                     'ImageType': img.get('ImageType', 'FRONT'),
                     'CameraId': img.get('CameraId', 'CAM-01'),
                     'CapturedAt': _iso_utc(img.get('CapturedAt')),
                     'Image': img.get('Image', '')
                 })
+            if not c.get('ContainerNumber') or not put_images:
+                return 'REJECTED'
             put_containers.append({
                 'ContainerNumber': c.get('ContainerNumber', ''),
-                'ContainerNumberConfidence': round(float(c.get('ContainerNumberConfidence', 0.0) or 0.0), 2),
-                'Size': str(c.get('Size', '20') or '20'),
+                'ContainerNumberConfidence': c.get('ContainerNumberConfidence'),
+                'Size': str(c['Size']) if c.get('Size') not in (None, '') else None,
                 'Position': c.get('Position', 'SINGLE'),
                 'Images': put_images
             })
 
+        if not put_containers:
+            return 'REJECTED'
         put_body = {'Containers': put_containers}
         audit_payload = {
             'id': payload.get('id'),
@@ -630,6 +644,9 @@ class ProsperSession:
             resp_body = res.text[:2000]
 
         if res.status_code in (200, 201, 204):
+            if isinstance(resp_body, dict) and resp_body.get('success') is False:
+                self._record_audit(audit_payload, url, res.status_code, resp_body, duration_ms, 'REJECTED')
+                return 'REJECTED'
             resp_data = resp_body if isinstance(resp_body, dict) else {}
             if isinstance(resp_data, dict) and 'eventId' not in resp_data:
                 resp_data['eventId'] = cloud_event_id
@@ -775,7 +792,7 @@ class CloudOutboxDispatcher:
         """
         if not ev or ev.get('status') == 'DUPLICATE':
             return False
-        if getattr(self.settings, 'strict_ocr_acceptance', False) and getattr(self.settings, 'deployment_mode', '') != 'test':
+        if getattr(self.settings, 'strict_ocr_acceptance', False):
             from app.ocr.acceptance import assess_identity
             if not assess_identity(ev)['accepted']:
                 return False
@@ -1222,8 +1239,69 @@ class CloudOutboxDispatcher:
             'containerNumber':containers[0]['ContainerNumber'], 'Truck':{'TruckNumber':'NA'},
             'Driver':None, 'Containers':containers}
 
+    def _overview_payload(self, event):
+        from app.snapshots.overview import VisitOverview
+        overview = VisitOverview(self.settings, self.snapshots).load(event.get('visit_id') or event['id'])
+        if overview is None:
+            raise ValueError('No coordinated overview was captured for this visit; OCR proof is retained separately')
+        images, missing = [], list(overview.get('missing_cameras', []))
+        configs = self._get_camera_configs()
+        visit = event.get('visit_id') or event['id']
+        for image in overview.get('images', []):
+            # Names are persisted by our coordinator; still reject traversal or
+            # an incorrectly linked manifest before touching image bytes.
+            name = image['file']
+            if Path(name).name != name or overview.get('visit_id') != visit:
+                raise ValueError('Overview image does not belong to this visit')
+            path = self.snapshots.path(f'{visit}/{name}')
+            if not path.is_file():
+                missing.append(image['camera_id'])
+                continue
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() != image['sha256']:
+                raise ValueError('Overview image integrity check failed')
+            images.append({'CameraId': image['camera_id'],
+                'ImageType': resolve_camera_image_type(image['camera_id'], configs),
+                'CapturedAt': image['captured_at'],
+                'Image': 'data:image/jpeg;base64,' + base64.b64encode(data).decode(),
+                '_image_path': str(path.relative_to(self.snapshots.root)).replace('\\', '/'),
+                '_image_hash': image['sha256']})
+        complete = bool(overview.get('complete')) and not missing
+        reasons = []
+        if overview.get('mode') != 'CAPTURE_LINE':
+            reasons.append('Calibrate one reference capture line for repeatable proof position')
+        if missing:
+            reasons.append('Missing aligned camera frames: ' + ', '.join(sorted(set(missing))))
+        if overview.get('unverified_cameras'):
+            reasons.append('Container visibility or ownership requires review: ' + ', '.join(overview['unverified_cameras']))
+        if overview.get('capture_spread_seconds', 0) > overview.get('sync_tolerance_seconds', .3):
+            reasons.append('Camera capture times exceed the configured synchronization tolerance')
+        numbers = [event.get('container_number') or event.get('candidate_number')]
+        if event.get('is_twin'):
+            numbers.append(event.get('container_number_2'))
+        containers = []
+        for index, number in enumerate(numbers):
+            iso = event.get('iso_code_1' if index == 0 else 'iso_code_2')
+            containers.append({'ContainerNumber': number,
+                'ContainerNumberConfidence': identity_confidence(event, None, number) if number else 0,
+                'Position': ('FRONT' if index == 0 else 'REAR') if event.get('is_twin') else 'SINGLE',
+                'Size': resolve_container_size(iso, None, is_twin=False) if iso else None,
+                '_iso_code': iso, 'Images': [dict(image) for image in images]})
+        # Distinct retained container records need distinct cloud idempotency
+        # keys; otherwise the second uncertain-twin record can be suppressed.
+        return {'id': event['id'], 'VisitId': 'VISIT-' + event['id'],
+            'EventType': 'GATE_OUT' if event.get('event_type') in ('EXIT', 'OUT', 'GATE_OUT') else 'GATE_IN',
+            'DeviceId': self.device_uuid, 'CapturedAt': overview['trigger_at'],
+            'containerNumber': numbers[0], 'Truck': {'TruckNumber': 'NA'}, 'Driver': None,
+            'Containers': containers, 'ProofVersion': event.get('proof_version', 1) or 1,
+            '_proof_complete': complete, '_proof_reason': '; '.join(reasons),
+            '_source_visit_id': visit,
+            '_overview': overview}
+
     def _final_capture_payload(self,event):
         """Final source-bound proofs, including explicitly unreadable departures."""
+        if self.settings.proof_capture_enabled:
+            return self._overview_payload(event)
         numbers = [event.get('container_number')]
         if event.get('is_twin'):
             numbers.append(event.get('container_number_2'))
@@ -1320,6 +1398,18 @@ class CloudOutboxDispatcher:
 
     def build_proof_preview(self, event_id):
         """Show matching source evidence without making a visit dispatchable."""
+        if self.settings.proof_capture_enabled:
+            event = self.repository.event(event_id) if self.repository else None
+            if not event or event.get('status') == 'DUPLICATE':
+                raise ValueError('No active event for proof preview')
+            store = OutgoingPreview(self.snapshots.root)
+            frozen = store.load(event_id)
+            if frozen is not None:
+                return frozen
+            payload = self._overview_payload(event)
+            if payload['_proof_complete'] and event.get('status') == 'CONFIRMED':
+                return store.freeze(event_id, payload)
+            return payload
         if getattr(self.settings, 'local_test_mode', False):
             return self.build_event_payload(event_id)
         event = self.repository.event(event_id) if self.repository else None
@@ -1337,6 +1427,13 @@ class CloudOutboxDispatcher:
         event = self.repository.event(event_id) if self.repository else None
         if event and event.get('status') == 'DUPLICATE':
             raise ValueError('Duplicate event cannot produce an upload payload')
+        if self.settings.proof_capture_enabled:
+            if not event or event.get('status') != 'CONFIRMED':
+                raise ValueError('Container identity requires review before upload')
+            payload = self.build_proof_preview(event_id)
+            if not payload.get('_proof_complete'):
+                raise ValueError(payload.get('_proof_reason') or 'Overview proof is incomplete')
+            return payload
         store = OutgoingPreview(self.snapshots.root) if self.snapshots and hasattr(self.snapshots, 'root') else None
         if store:
             saved = store.load(event_id)
@@ -1756,7 +1853,8 @@ class CloudOutboxDispatcher:
                 cloud_ev_id = None
                 if isinstance(res, dict):
                     cloud_ev_id = res.get('eventId') or res.get('visitDatabaseId')
-            if res in (True, 'CONFLICT') or isinstance(res, dict):
+            if (res is True or (isinstance(res, dict) and res.get('success') is not False)
+                    or (res == 'CONFLICT' and not existing_cloud_id)):
                 p_ver = payload.get('ProofVersion', (event_record or {}).get('proof_version', 1) or 1)
                 final_cloud_id = cloud_ev_id or existing_cloud_id or f"CLOUD-{event_id}"
                 if self.repository:
@@ -1871,7 +1969,8 @@ class CloudOutboxDispatcher:
                 log.warning('prosper_dispatch_exception: %s', exc, extra={'event_id': event_id, 'error': str(exc)})
                 success = 'OFFLINE'
 
-            if success in (True, 'CONFLICT') or isinstance(success, dict):
+            if (success is True or (isinstance(success, dict) and success.get('success') is not False)
+                    or (success == 'CONFLICT' and not (current or {}).get('cloud_event_id'))):
                 self._is_online = True
                 self._last_sync_time = datetime.now(timezone.utc).isoformat()
                 self._last_error = None

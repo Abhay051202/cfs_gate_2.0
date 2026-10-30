@@ -17,7 +17,8 @@ def health(request: Request):
     enabled = [c for c in cameras if c['enabled']]
     active = [c for c in enabled if c.get('active_source_id') or c.get('video') or c.get('status') == 'ONLINE']
     spool = runtime.ocr_store.status()
-    ready = database == 'READY' and not request.app.state.startup_error and not runtime.last_processing_error and not runtime.ocr_spool_error and not spool['failed']
+    held_visits = getattr(runtime, '_finalization_failures', {})
+    ready = database == 'READY' and not request.app.state.startup_error and not runtime.last_processing_error and not runtime.ocr_spool_error and not spool['failed'] and not held_visits
     if runtime.settings.pipeline_enabled:
         ready = ready and runtime.model_status['detector'] == 'READY' and runtime.model_status['ocr'] == 'READY'
         if active:
@@ -39,6 +40,8 @@ def health(request: Request):
                                       'reversal_grace_seconds': runtime.settings.reversal_grace_seconds,
                                       'cross_camera_arrival_window_seconds': runtime.settings.cross_camera_arrival_window_seconds,
                                       'active_visits': len(runtime.passages.active)},
+                         'held_visits': [{'visit_id': key, 'attempts': value['attempts'], 'reason': value['reason']}
+                                         for key, value in held_visits.items()],
                          'startup_error': request.app.state.startup_error}, status_code=200 if server_alive else 503)
 
 

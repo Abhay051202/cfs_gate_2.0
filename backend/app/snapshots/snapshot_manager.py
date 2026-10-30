@@ -239,11 +239,51 @@ class SnapshotManager:
                 pass
             return score
 
+        # Anchor-Synchronized Multi-View Proof Selection:
+        # Determine anchor timestamp from the primary verified OCR proof so all cameras
+        # show the truck in the EXACT SAME POSITION and moment.
+        anchor_snap = None
+        for pref_id in preferred_ids:
+            for snaps in by_camera.values():
+                for s in snaps:
+                    if s.get('id') == pref_id:
+                        anchor_snap = s
+                        break
+                if anchor_snap:
+                    break
+        if not anchor_snap:
+            # Find the highest scoring proof across all cameras to serve as anchor
+            all_snaps = [s for snaps in by_camera.values() for s in snaps]
+            if all_snaps:
+                anchor_snap = max(all_snaps, key=snap_score)
+
+        anchor_dt = None
+        if anchor_snap and anchor_snap.get('timestamp'):
+            from datetime import datetime
+            ts_str = str(anchor_snap['timestamp']).replace('Z', '+00:00')
+            try:
+                anchor_dt = datetime.fromisoformat(ts_str)
+            except Exception:
+                pass
+
         captures = []
-        for items in by_camera.values():
-            captures.append(max(
-                items, key=lambda item: (snap_score(item), item.get('timestamp') or '')
-            ))
+        for cam_id, items in by_camera.items():
+            if anchor_dt and len(items) > 1:
+                def _sync_score(item):
+                    base_s = snap_score(item)
+                    item_ts = str(item.get('timestamp') or '').replace('Z', '+00:00')
+                    try:
+                        dt = datetime.fromisoformat(item_ts)
+                        # Penalize time drift from the anchor snapshot (50 points per second of drift)
+                        drift_sec = abs((dt - anchor_dt).total_seconds())
+                        return base_s - (drift_sec * 50.0)
+                    except Exception:
+                        return base_s
+                captures.append(max(items, key=_sync_score))
+            else:
+                captures.append(max(
+                    items, key=lambda item: (snap_score(item), item.get('timestamp') or '')
+                ))
 
         # Ensure all explicitly designated proof snapshots are included
         existing_ids = {c['id'] for c in captures}

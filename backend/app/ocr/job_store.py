@@ -205,7 +205,13 @@ class OCRJobStore:
     def connection(self):
         db = sqlite3.connect(self.path, timeout=5)
         db.row_factory = sqlite3.Row
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('PRAGMA busy_timeout=5000')
         db.execute('PRAGMA synchronous=NORMAL')
+        try:
+            db.execute('ALTER TABLE jobs ADD COLUMN worker_id TEXT')
+        except Exception:
+            pass
         db.execute('''CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY, origin TEXT NOT NULL, sequence INTEGER NOT NULL,
             metadata TEXT NOT NULL, crop TEXT NOT NULL, image TEXT NOT NULL,
@@ -307,13 +313,15 @@ class OCRJobStore:
                        (job.origin_key, job.origin_key))
             return job_id
 
-    def clean_stale_pending(self, max_age_seconds: float = 60.0):
+    def clean_stale_pending(self, max_age_seconds: float = 60.0, protected_origins: tuple = ()):
         """Mark uncompleted jobs from expired/historical passages as superseded."""
         with self.connection() as db:
             cutoff = time.time() - max_age_seconds
-            rows = db.execute("SELECT id, metadata FROM jobs WHERE state='PENDING'").fetchall()
+            rows = db.execute("SELECT id, origin, metadata FROM jobs WHERE state='PENDING'").fetchall()
             stale_ids = []
             for r in rows:
+                if protected_origins and r['origin'] in protected_origins:
+                    continue
                 try:
                     meta = json.loads(r['metadata'])
                     ts_str = meta.get('frame', {}).get('timestamp') or meta.get('started_at')
@@ -335,11 +343,26 @@ class OCRJobStore:
             row = db.execute("SELECT event_id FROM jobs WHERE id=? AND state='DONE'", (job_id,)).fetchone()
             return row['event_id'] if row else None
 
-    def next_id(self):
+    def next_id(self, worker_id: str = "gate-ocr-1"):
+        now = time.time()
         with self.connection() as db:
+            try:
+                claimed = db.execute(
+                    "UPDATE jobs SET state='IN_PROGRESS', worker_id=? "
+                    "WHERE id = (SELECT id FROM jobs WHERE state='PENDING' AND retry_at<=? ORDER BY id ASC LIMIT 1) RETURNING id",
+                    (worker_id, now)
+                ).fetchone()
+                if claimed:
+                    return claimed['id']
+            except Exception:
+                pass
             row = db.execute("SELECT id FROM jobs WHERE state='PENDING' AND retry_at<=? ORDER BY id ASC LIMIT 1",
-                             (time.time(),)).fetchone()
-            return row['id'] if row else None
+                             (now,)).fetchone()
+            if row:
+                jid = row['id']
+                db.execute("UPDATE jobs SET state='IN_PROGRESS', worker_id=? WHERE id=? AND state='PENDING'", (worker_id, jid))
+                return jid
+            return None
 
 
     def passage_jobs(self):
@@ -813,7 +836,7 @@ class OCRJobStore:
                 db.execute("UPDATE jobs SET attempts=?, state='FAILED', error_type=? WHERE id=?",
                            (curr, error_type, job_id))
             else:
-                db.execute('UPDATE jobs SET attempts=?, retry_at=?, error_type=? WHERE id=?',
+                db.execute("UPDATE jobs SET attempts=?, retry_at=?, error_type=?, state='PENDING' WHERE id=?",
                            (curr, time.time() + 5, error_type, job_id))
 
     def status(self):

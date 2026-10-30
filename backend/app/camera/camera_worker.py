@@ -24,6 +24,7 @@ class CameraWorker:
         self._test_lock = threading.Lock()
         self._pending = None
         self._latest = None
+        self._proof_frames = deque(maxlen=settings.proof_buffer_frames)
         self._status = 'OFFLINE'
         self._reason = 'not_started'
         self._last_frame = None
@@ -97,6 +98,10 @@ class CameraWorker:
                 self._dropped += 1
             self._pending = Frame(self.config.id, timestamp, self._sequence, image, self.source_id)
             self._latest = self._pending
+            self._proof_frames.append(self._latest)
+            while len(self._proof_frames) > 1 and sum(
+                    f.image.nbytes for f in self._proof_frames) > self.settings.proof_buffer_mb * 1024 * 1024:
+                self._proof_frames.popleft()
             self._cached_jpeg = None
             self._cached_seq = None
             self._last_frame = timestamp.isoformat() + 'Z'
@@ -132,6 +137,13 @@ class CameraWorker:
     def latest(self):
         with self._lock:
             return self._latest
+
+    def nearest_frame(self, timestamp, tolerance):
+        """Receive-time alignment; never return a frame from an old connection."""
+        with self._lock:
+            frames = [f for f in self._proof_frames if f.source_id == self.source_id
+                      and abs((f.timestamp - timestamp).total_seconds()) <= tolerance]
+            return min(frames, key=lambda f: abs((f.timestamp-timestamp).total_seconds()), default=None)
 
     def status(self):
         with self._lock:

@@ -10,27 +10,37 @@ LETTER_VALUES = dict(zip('ABCDEFGHIJKLMNOPQRSTUVWXYZ', (n for n in range(10, 39)
 STRUCTURE = re.compile(r'^[A-Z]{3}[UJZ][0-9]{7}$')
 CANDIDATE = re.compile(r'(?<![A-Z0-9])([A-Z][\s-]*[A-Z][\s-]*[A-Z][\s-]*[UJZ](?:[\s-]*[0-9]){7})(?![A-Z0-9])')
 
-# ISO 6346 Container Size-Type Code pattern (e.g. 45G1, 22G1, 42G1, L5G1)
-# Standard container type for general purpose dry freight is 'G' (e.g. G0, G1).
-# OCR engines frequently confuse 'G' with 'C' (e.g. 45C1, 22C1, 42C1).
-# ISO 6346 defines NO type code 'C'. We correct 'C' to 'G' for all ISO container size-type patterns.
+# Standard BIC shipping line prefixes for checksum-verified 1-missing-owner-char glare recovery
+STANDARD_BIC_PREFIXES = frozenset({
+    'OOCU', 'OOLU', 'MSCU', 'MEDU', 'MAEU', 'MRKU', 'MRSU', 'MSKU', 'CMAU', 'CGMU',
+    'HLCU', 'HLXU', 'HAMU', 'SUDU', 'ONEU', 'NYKU', 'MOLU', 'KKLU', 'COSU', 'CBHU',
+    'CSNU', 'CSLU', 'WHLU', 'YMLU', 'EGHU', 'EITU', 'EMCU', 'ZIMU', 'ZCSU', 'SEGU',
+    'TCNU', 'TCLU', 'TGBU', 'TEMU', 'TRHU', 'TRLU', 'TLLU', 'FCIU', 'CAIU', 'BMOU',
+    'DRYU', 'GESU', 'UACU', 'HDMU', 'HASU', 'PONU', 'APZU', 'APLU', 'BSIU', 'CXDU',
+    'DFSU', 'FSCU', 'GAOU', 'GLDU', 'INKU', 'LTIU', 'MAGU', 'MSMU', 'MSNU', 'MWCU',
+    'NLLU', 'PCIU', 'PIDU', 'RFCU', 'SITU', 'SKLU', 'SLSU', 'SMLU', 'TCKU', 'TGHU',
+    'TIIU', 'TINU', 'TKRU', 'TOLU', 'TPHU', 'TRIU', 'TSSU', 'TTNU', 'TXGU', 'UESU',
+    'UETU', 'UNIU', 'WCIU', 'XINU', 'FFAU', 'FANU', 'CCLU',
+})
+
 # ISO 6346 Container Size-Type Code pattern (e.g. 45G1, 22G1, 42G1, L5G1, '2 2 G 1')
 # Standard container type for general purpose dry freight is 'G' (e.g. G0, G1).
-# OCR engines frequently confuse 'G' with 'C' (e.g. 45C1, 22C1, 42C1).
-# ISO 6346 defines NO type code 'C'. We correct 'C' to 'G' for all ISO container size-type patterns.
+# OCR engines frequently confuse 'G' with 'C' or '6' (e.g. 45C1, 4561, 22C1, 2261, 42C1, 4261).
+# ISO 6346 defines NO type code 'C' or digit '6' in position 3.
 SIZE_CODE_PATTERN = re.compile(r'(?<![A-Z0-9])([1-4LMN])\s*([0-9])\s*([GVRHBUTP])\s*([0-9A-Z])(?![A-Z0-9])', re.IGNORECASE)
 SIZE_CODE_C_MISTAKE = re.compile(r'(?<![A-Z0-9])([1-4LMN])\s*([0-9])\s*C\s*([0-9A-Z]?)(?![A-Z0-9])', re.IGNORECASE)
+SIZE_CODE_6_MISTAKE = re.compile(r'(?<![A-Z0-9])([24L])\s*([25])\s*6\s*([01])(?![A-Z0-9])', re.IGNORECASE)
 
 
 def correct_feet_size_codes(text: str) -> str:
     """
-    Correct OCR misreads where 'G' in container size markings is read as 'C'.
-    E.g. 45C1 -> 45G1, 22C1 -> 22G1, 42C1 -> 42G1, L5C1 -> L5G1, 45C -> 45G1
+    Correct OCR misreads where 'G' in container size markings is read as 'C' or '6'.
+    E.g. 45C1 -> 45G1, 4561 -> 45G1, 22C1 -> 22G1, 2261 -> 22G1, 42C1 -> 42G1, L5C1 -> L5G1
     """
     if not text:
         return ''
-    # 1. Correct [Size][C][Char] -> [Size][G][Char]
     corrected = SIZE_CODE_C_MISTAKE.sub(lambda m: f"{m.group(1).upper()}{m.group(2).upper()}G{m.group(3).upper() or '1'}", text)
+    corrected = SIZE_CODE_6_MISTAKE.sub(lambda m: f"{m.group(1).upper()}{m.group(2).upper()}G{m.group(3).upper()}", corrected)
     return corrected
 
 
@@ -123,12 +133,26 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
        is read as 'L', '1', 'I', '|', or 'A'.
     2. Owner digit confusions ('0'->'O', '1'->'I', '8'->'B', '5'->'S', '2'->'Z', 'D'->'O').
     3. Serial letter confusions ('O'->'0', 'I'->'1', 'L'->'1', 'S'->'5', 'B'->'8', 'Z'->'2').
-    4. Substring candidate in noisy string (11-char window).
+    4. Substring candidate in noisy string (11-char window), including stripping trailing ISO size codes.
+    5. Glare/corrugation 3-char prefix + 7-digit serial (10 chars, e.g. '0CI7257753' -> 'OOCU7257753').
     
     STRICT RULE: A candidate is ONLY accepted if check_digit(cand[:10]) == int(cand[10])
     AND exactly ONE candidate matches.
     """
-    compact = normalize(raw)
+    cleaned_raw = correct_feet_size_codes(raw or '')
+    # Strip standalone 4-char ISO size-type tokens (e.g. '45G1', '22G1') when preceded by a 10..12-char container token
+    tokens = cleaned_raw.upper().split()
+    if len(tokens) >= 2 and SIZE_CODE_PATTERN.fullmatch(tokens[-1]):
+        leading = normalize(' '.join(tokens[:-1]))
+        if 10 <= len(leading) <= 13:
+            compact = leading
+        else:
+            compact = normalize(cleaned_raw)
+    else:
+        compact = normalize(cleaned_raw)
+        if 14 <= len(compact) <= 16 and SIZE_CODE_PATTERN.fullmatch(compact[-4:]):
+            compact = compact[:-4]
+
     valid_candidates = set()
 
     # Reorder swapped serial + owner tokens (e.g. '8 546355 CMAU' -> 'CMAU8546355')
@@ -162,13 +186,18 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
                 dp[i][j] = min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost)
         return dp[m][n]
 
+    OWNER_REPAIR = {'0': 'O', '1': 'I', '8': 'B', '5': 'S', '2': 'Z', '6': 'G', '4': 'H', '7': 'T', 'D': 'O'}
+    CATEGORY_REPAIR = {'0': 'U', 'O': 'U', 'V': 'U', 'W': 'U', '1': 'U', 'I': 'U', 'D': 'U', 'L': 'U', 'C': 'U'}
+    SERIAL_REPAIR = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'S': '5', 'B': '8', 'Z': '2', 'A': '4', 'T': '7', 'G': '6'}
+
     # 1. Exact check-digit match on any 11-char window or phantom separator removal
     for window in windows_11:
         if STRUCTURE.fullmatch(window) and check_digit(window[:10]) == int(window[10]):
-            if _levenshtein(compact, window) <= 2:
+            if _levenshtein(compact if len(compact) <= 12 else window, window) <= 2:
                 valid_candidates.add(window)
 
-    # 2. Missing check digit repair (10 chars -> 11 chars)
+    # 2. 10-char repairs:
+    # (a) Missing check digit repair (4 letters + 6 digits -> 11 chars)
     if len(compact) == 10 and re.fullmatch(r'[A-Z]{3}[UJZ][0-9]{6}', compact):
         try:
             cand = compact + str(check_digit(compact))
@@ -177,11 +206,34 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
         except Exception:
             pass
 
-    # 3. Character substitutions on 11-char candidate windows
-    OWNER_REPAIR = {'0': 'O', '1': 'I', '8': 'B', '5': 'S', '2': 'Z', '6': 'G', '4': 'H', '7': 'T', 'D': 'O'}
-    CATEGORY_REPAIR = {'0': 'U', 'O': 'U', 'V': 'U', 'W': 'U', '1': 'J', 'I': 'J', 'D': 'U', 'L': 'U', 'C': 'U'}
-    SERIAL_REPAIR = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'S': '5', 'B': '8', 'Z': '2', 'A': '4', 'T': '7', 'G': '6'}
+    # (b) Glare / corrugation 1-dropped-owner-letter repair (3 prefix chars + 7 digits, e.g. '0CI7257753' -> 'OOCU7257753')
+    if len(compact) == 10 and re.fullmatch(r'[A-Z0-9]{3}[0-9]{7}', compact):
+        p0 = OWNER_REPAIR.get(compact[0], compact[0]) if compact[0].isdigit() else compact[0]
+        p1 = OWNER_REPAIR.get(compact[1], compact[1]) if compact[1].isdigit() else compact[1]
+        p2 = compact[2] if compact[2] in ('U', 'J', 'Z') else CATEGORY_REPAIR.get(compact[2], compact[2])
+        serial7 = compact[3:]
+        if p0.isalpha() and p1.isalpha() and p2 in ('U', 'J', 'Z'):
+            # Try duplicating either adjacent owner letter first (e.g. 'OCU' -> 'OOCU' or 'OCCU')
+            dup_prefixes = {f"{p0}{p0}{p1}{p2}", f"{p0}{p1}{p1}{p2}"}
+            dup_matches = set()
+            for dp_pref in dup_prefixes:
+                cand = dp_pref + serial7
+                if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
+                    dup_matches.add(cand)
+            if len(dup_matches) == 1:
+                valid_candidates.update(dup_matches)
+            else:
+                # Otherwise check STANDARD_BIC_PREFIXES that contain (p0, p1) in order with category p2
+                bic_matches = set()
+                for bic in STANDARD_BIC_PREFIXES:
+                    if bic[3] == p2 and (bic[1:3] == f"{p0}{p1}" or (bic[0] == p0 and bic[2] == p1) or bic[:2] == f"{p0}{p1}"):
+                        cand = bic + serial7
+                        if check_digit(cand[:10]) == int(cand[10]):
+                            bic_matches.add(cand)
+                if len(bic_matches) == 1:
+                    valid_candidates.update(bic_matches)
 
+    # 3. Character substitutions on 11-char candidate windows
     targets = list(windows_11)
     if normalized and len(normalized) == 11 and normalized not in targets:
         targets.insert(0, normalized)
@@ -189,6 +241,7 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
     for target in targets:
         if len(target) != 11:
             continue
+        ref_str = compact if len(compact) <= 12 else target
         # Combined positional type repair (digits in owner 0..2, category in 3, letters in serial 4..10)
         pos_fixed = list(target)
         changed = False
@@ -206,7 +259,7 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
         if changed:
             cand = ''.join(pos_fixed)
             if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
-                if _levenshtein(compact, cand) <= 2:
+                if _levenshtein(ref_str, cand) <= 2:
                     valid_candidates.add(cand)
             # In vertical crops, 'N' or 'L' is often read as '1' (e.g. 'M51U1944387' or '15101944387' -> 'MSNU1944387')
             for idx in range(3):
@@ -216,12 +269,12 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
                         alt_fixed[idx] = alt_letter
                         alt_cand = ''.join(alt_fixed)
                         if STRUCTURE.fullmatch(alt_cand) and check_digit(alt_cand[:10]) == int(alt_cand[10]):
-                            if _levenshtein(compact, alt_cand) <= 2:
+                            if _levenshtein(ref_str, alt_cand) <= 2:
                                 valid_candidates.add(alt_cand)
             if target[:4] in ('1510', '151U', 'M510', 'M51U'):
                 msnu_cand = 'MSNU' + ''.join(pos_fixed[4:])
                 if STRUCTURE.fullmatch(msnu_cand) and check_digit(msnu_cand[:10]) == int(msnu_cand[10]):
-                    if _levenshtein(compact, msnu_cand) <= 2:
+                    if _levenshtein(ref_str, msnu_cand) <= 2:
                         valid_candidates.add(msnu_cand)
 
         # Single-char owner/category repair
@@ -232,7 +285,7 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
                 chars[idx] = OWNER_REPAIR[orig]
                 cand = ''.join(chars)
                 if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
-                    if _levenshtein(compact, cand) <= 2:
+                    if _levenshtein(ref_str, cand) <= 2:
                         valid_candidates.add(cand)
                 chars[idx] = orig
         if chars[3] in CATEGORY_REPAIR:
@@ -240,7 +293,7 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
             chars[3] = CATEGORY_REPAIR[orig3]
             cand = ''.join(chars)
             if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
-                if _levenshtein(compact, cand) <= 2:
+                if _levenshtein(ref_str, cand) <= 2:
                     valid_candidates.add(cand)
             chars[3] = orig3
 
@@ -251,24 +304,26 @@ def repair_container_candidate(raw: str, normalized: str) -> str | None:
                 chars[idx] = SERIAL_REPAIR[orig]
                 cand = ''.join(chars)
                 if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
-                    if _levenshtein(compact, cand) <= 2:
+                    if _levenshtein(ref_str, cand) <= 2:
                         valid_candidates.add(cand)
                 chars[idx] = orig
 
-        # Single-digit serial confusion repair (e.g. stencil '3' read as '8')
+        # Single-digit serial confusion repair (e.g. stencil '3'<->'8', vertical '1'<->'7')
         for idx in range(4, 10):
             orig = chars[idx]
-            if orig in ('8', '3'):
-                chars[idx] = '3' if orig == '8' else '8'
-                cand = ''.join(chars)
-                if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
-                    if _levenshtein(compact, cand) <= 2:
-                        valid_candidates.add(cand)
-                chars[idx] = orig
+            for a, b in (('8', '3'), ('3', '8'), ('1', '7'), ('7', '1')):
+                if orig == a:
+                    chars[idx] = b
+                    cand = ''.join(chars)
+                    if STRUCTURE.fullmatch(cand) and check_digit(cand[:10]) == int(cand[10]):
+                        if _levenshtein(ref_str, cand) <= 2:
+                            valid_candidates.add(cand)
+                    chars[idx] = orig
 
     if valid_candidates:
-        min_dist = min(_levenshtein(compact, c) for c in valid_candidates)
-        closest = [c for c in valid_candidates if _levenshtein(compact, c) == min_dist]
+        ref_base = compact if len(compact) <= 12 else (targets[0] if targets else compact)
+        min_dist = min(_levenshtein(ref_base, c) for c in valid_candidates)
+        closest = [c for c in valid_candidates if _levenshtein(ref_base, c) == min_dist]
         if len(closest) == 1 and min_dist <= 2:
             return closest[0]
     return None
@@ -305,4 +360,3 @@ class ContainerValidator:
         status = 'VALID' if valid_digit else 'INVALID_CHECK_DIGIT' if valid_format else 'INVALID_FORMAT'
         iso_code, human_size = extract_iso_size_code(raw)
         return Validation(raw, normalized, read.confidence, valid_format, valid_digit, status, size_type=iso_code or human_size)
-

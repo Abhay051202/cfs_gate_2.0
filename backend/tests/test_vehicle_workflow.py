@@ -837,51 +837,48 @@ def test_moving_container_text_and_companion_camera_finish_as_one_event(settings
     assert cameras_in_proof == {'camera-1', 'gate-in-3'}
 
 
-def test_early_finalization_on_gate_stop_and_late_second_camera_override(settings, repository, snapshots, camera, make_job):
-    """When a truck stops at a multi-camera gate for security checking, confirm and dispatch immediately
-    as soon as 1 camera reads a valid check-digit container number, then override images when Camera 2 reads it."""
+def test_strict_visit_waits_for_late_camera_before_finalization(settings, repository, snapshots, camera, make_job):
+    # Production policy observes the whole visit; a stationary first-camera
+    # reading cannot publish an incomplete, subsequently replaced proof set.
     settings.shared_visit_folders = True
     settings.container_roi_trigger = True
-    settings.ocr_confirmations = 1
-    settings.minimum_number_proof_cameras = 1
-    cam1 = camera.model_copy(update={'id': 'gate-out-2', 'role': 'FRONT', 'gate_id': 'lane-out', 'direction_by_heading': 'EXIT'})
-    cam2 = camera.model_copy(update={'id': 'gate-out-1', 'role': 'REAR', 'gate_id': 'lane-out', 'direction_by_heading': 'EXIT'})
+    settings.ocr_confirmations = 2
+    settings.minimum_number_proof_cameras = 2
+    settings.strict_ocr_acceptance = True
+    cam1 = camera.model_copy(update={'id': 'gate-out-2', 'role': 'FRONT_TOP', 'gate_id': 'lane-out', 'direction': 'EXIT'})
+    cam2 = camera.model_copy(update={'id': 'gate-out-1', 'role': 'REAR', 'gate_id': 'lane-out', 'direction': 'EXIT'})
     repository.sync_cameras([cam1, cam2])
     r, f = setup(settings, repository, snapshots, cam1, make_job)
     f = replace(f, camera_id=cam1.id)
     r.cameras = [cam1, cam2]
-
-    # Step 1: Truck arrives at cam1 and stops for checking (cam2 has NOT seen the number yet, truck has NOT departed)
-    measure(r, cam1, f, 0, [('truck', (20, 20, 600, 460)), ('container_number', (100, 80, 180, 140))])
+    boxes = [('truck', (20,20,600,460)), ('container_number', (100,80,180,140))]
+    for t in (0, 1):
+        measure(r, cam1, f, t, boxes)
+        drain(r)
+    r._finalize_passages()
+    assert repository.events()['total'] == 0
+    assert r.dispatcher.enqueue.call_count == 0
+    # Camera 1 continues observing the stationary truck while Camera 2's
+    # useful view arrives later; continuous feed is not a 14-second outage.
+    for t in range(2, 15):
+        measure(r, cam1, f, t, boxes)
+        drain(r)
+    for t in (15, 16):
+        measure(r, cam2, replace(f, camera_id=cam2.id), t, boxes)
+        drain(r)
+    r._finalize_passages()
+    assert repository.events()['total'] == 0
+    for t in range(18, 28):
+        for cam in (cam1, cam2):
+            measure(r, cam, replace(f, camera_id=cam.id), t, [])
+    r._finalize_passages()
     drain(r)
     r._finalize_passages()
-
-    # Event must be finalized immediately without waiting for cam2 or physical departure
     events = repository.events()['items']
     assert len(events) == 1
-    ev_id = events[0]['id']
-    assert events[0]['container_number'] == 'CSQU3054383'
-    assert events[0]['status'] == 'CONFIRMED'
+    detail = repository.event(events[0]['id'])
+    assert {s['camera_id'] for s in detail['snapshots']} == {cam1.id, cam2.id}
     assert r.dispatcher.enqueue.call_count == 1
-
-    # Simulate Step 1 cloud sync completing with cloud_event_id
-    repository.mark_cloud_synced(ev_id, cloud_event_id='0e7d4fac-5f22-48a4-be37-0bc58a948eff')
-    assert repository.event(ev_id)['cloud_synced'] is True
-
-    # Step 2: 15 seconds later, truck moves forward after security check and cam2 (REAR) captures the container
-    f_cam2 = replace(f, camera_id=cam2.id)
-    measure(r, cam2, f_cam2, 15, [('truck', (30, 20, 610, 460)), ('container_number', (110, 80, 190, 140))])
-    drain(r)
-    r._finalize_passages()
-
-    # Same event must now have both camera proofs, cloud_synced reset to False, and re-enqueued for PUT /images override
-    events_after = repository.events()['items']
-    assert len(events_after) == 1
-    updated_detail = repository.event(ev_id)
-    assert {s['camera_id'] for s in updated_detail['snapshots']} == {'gate-out-2', 'gate-out-1'}
-    assert updated_detail['cloud_synced'] is False
-    assert updated_detail['cloud_event_id'] == '0e7d4fac-5f22-48a4-be37-0bc58a948eff'
-    assert r.dispatcher.enqueue.call_count == 2
 
 
 def test_back_to_back_out_gate_containers_not_skipped(settings, repository, snapshots, camera, make_job):

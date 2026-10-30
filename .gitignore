@@ -154,4 +154,6 @@ docs/chat.md
 *.tar.gz
 *.7z
 *.rar
+backend/.test-*/
+backend/local-test/
 ReachStacker*
