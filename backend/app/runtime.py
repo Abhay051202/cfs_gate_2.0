@@ -1215,10 +1215,34 @@ class GateRuntime:
                     all(not r.pending for r in p.regions)
                     for p in group
                 )
-                full_lane_coverage = bool(number_cameras) and all(
+                rear_cams = {c.id for c in self.cameras if c.enabled and c.gate_id == group[0].gate_id and (c.role == 'REAR' or 'rear' in c.id.lower() or '-1' in c.id)}
+                has_valid_read = any(
+                    getattr(v, 'valid_check_digit', False) and getattr(v, 'confidence', 0) >= 0.50
+                    for p in group for r in p.regions for v, _ in r.reads.values()
+                )
+                rear_proven = not rear_cams or any(
+                    p.camera_id in rear_cams and (
+                        any(_region_confirmed(r) for r in p.regions if not r.context_only) or
+                        any(r.reads for r in p.regions) or
+                        p.body_observed
+                    )
+                    for p in group
+                )
+                observed_cams = {
+                    p.camera_id for p in group
+                    if p.body_observed or any(r.reads for r in p.regions) or p.candidates or p.closed
+                }
+                lane_observed = expected.issubset(observed_cams) or len(observed_cams) >= len(expected)
+                all_proofs_ready = bool(
+                    has_valid_read and
+                    rear_proven and
+                    lane_observed and
+                    all(not r.pending for p in group for r in p.regions)
+                )
+                full_lane_coverage = all_proofs_ready or (bool(number_cameras) and all(
                     expected.issubset(cams) or len(cams) >= len(expected)
                     for cams in number_cameras.values()
-                )
+                ))
                 if confirmed_regions and (all(p.closed for p in group) or full_lane_coverage):
                     for p in group:
                         for r in p.regions:
@@ -1473,10 +1497,34 @@ class GateRuntime:
                 for region in p.regions:
                     for number, proofs in region.source_proofs.items():
                         number_cameras.setdefault(number, set()).update(proofs)
-            full_lane_coverage = bool(number_cameras) and all(
+            rear_cams = {c.id for c in self.cameras if c.enabled and c.gate_id == group[0].gate_id and (c.role == 'REAR' or 'rear' in c.id.lower() or '-1' in c.id)}
+            has_valid_read = any(
+                getattr(v, 'valid_check_digit', False) and getattr(v, 'confidence', 0) >= 0.50
+                for p in group for r in p.regions for v, _ in r.reads.values()
+            )
+            rear_proven = not rear_cams or any(
+                p.camera_id in rear_cams and (
+                    any(_region_confirmed(r) for r in p.regions if not r.context_only) or
+                    any(r.reads for r in p.regions) or
+                    p.body_observed
+                )
+                for p in group
+            )
+            observed_cams = {
+                p.camera_id for p in group
+                if p.body_observed or any(r.reads for r in p.regions) or p.candidates or p.closed
+            }
+            lane_observed = expected.issubset(observed_cams) or len(observed_cams) >= len(expected)
+            all_proofs_ready = bool(
+                has_valid_read and
+                rear_proven and
+                lane_observed and
+                all(not r.pending for p in group for r in p.regions)
+            )
+            full_lane_coverage = all_proofs_ready or (bool(number_cameras) and all(
                 expected.issubset(cams) or len(cams) >= len(expected)
                 for cams in number_cameras.values()
-            )
+            ))
             if mode in ('early', 'update') and not full_lane_coverage:
                 confirmed_cams = {p.camera_id for p in group if any(_region_confirmed(r) for r in p.regions if not r.context_only)}
                 self._early_finalized_visits[visit_id] = confirmed_cams
