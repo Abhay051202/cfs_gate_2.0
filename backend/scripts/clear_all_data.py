@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 def clear_all():
-    base_dir = Path(r"d:\ai-video-based-inventory\ai-video-based-inventory\backend")
+    base_dir = Path(__file__).resolve().parent.parent
     db_path = base_dir / "data" / "gate.db"
     spool_db_path = base_dir / "uploads" / "ocr-spool" / "jobs.sqlite3"
     snapshots_dir = base_dir / "snapshots"

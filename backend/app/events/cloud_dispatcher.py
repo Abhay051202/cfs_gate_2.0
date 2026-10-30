@@ -738,7 +738,7 @@ class CloudOutboxDispatcher:
 
     def status(self) -> dict:
         pending_count = 0
-        if self.repository and hasattr(self.repository, 'count_unsynced_confirmed_events'):
+        if self.enabled and self.repository and hasattr(self.repository, 'count_unsynced_confirmed_events'):
             try:
                 pending_count = self.repository.count_unsynced_confirmed_events()
             except Exception:
